@@ -168,7 +168,22 @@ export async function runToolLoop(
       };
     }
 
-    // tool_call
+    // tool_call — validate tool name against known tools (code review fix)
+    const knownToolNames = ctx.tools.map((t) => t.name);
+    if (!knownToolNames.includes(parsed.tool)) {
+      ctx.onLog?.({
+        type: "parse_error",
+        iteration: iter,
+        error: `Unknown tool "${parsed.tool}". Known: ${knownToolNames.join(", ")}`,
+      });
+      messages.push({ role: "assistant", content: resp.content });
+      messages.push({
+        role: "user",
+        content: `Verktøyet "${parsed.tool}" finnes ikke. Tilgjengelige verktøy: ${knownToolNames.join(", ")}. Prøv igjen.`,
+      });
+      continue;
+    }
+
     ctx.onLog?.({
       type: "tool_call",
       iteration: iter,

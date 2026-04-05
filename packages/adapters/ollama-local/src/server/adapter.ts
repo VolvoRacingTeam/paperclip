@@ -270,12 +270,10 @@ function extractUserMessage(ctx: AdapterExecutionContext): string {
     const v = c[key];
     if (typeof v === "string" && v.trim().length > 0) return v;
   }
-  // Fallback: stringify the whole context object (debugging aid).
-  try {
-    return JSON.stringify(c);
-  } catch {
-    return "";
-  }
+  // No well-known prompt key found. Return empty string to trigger
+  // failResult("no_user_message") — do NOT stringify the raw context
+  // as it may contain internal fields or credentials.
+  return "";
 }
 
 function extractSystemPrompt(ctx: AdapterExecutionContext): string | undefined {
