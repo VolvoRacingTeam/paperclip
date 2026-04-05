@@ -35,3 +35,23 @@ export {
   type ExecuteOllamaLocalOptions,
   type OllamaLocalRuntimeConfig,
 } from "./execute.js";
+
+// ---------------------------------------------------------------------------
+// Paperclip-facing factory (see ADR-001)
+// ---------------------------------------------------------------------------
+
+export {
+  createOllamaLocalServerAdapter,
+  executeAdapter,
+  testEnvironment,
+  type CreateOllamaLocalServerAdapterOptions,
+} from "./adapter.js";
+
+export type {
+  PluginToolDispatcherLike,
+  ToolDescriptorLike,
+  ToolListFilterLike,
+  ToolRunContextLike,
+  ToolResultLike,
+  ToolExecutionResultLike,
+} from "./tool-dispatcher-contract.js";

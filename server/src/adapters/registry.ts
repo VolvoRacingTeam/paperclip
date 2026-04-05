@@ -237,3 +237,12 @@ export async function detectAdapterModel(
 export function findServerAdapter(type: string): ServerAdapterModule | null {
   return adaptersByType.get(type) ?? null;
 }
+
+// ---------------------------------------------------------------------------
+// SON-97: registerServerAdapter — late-injection hook for factory-built
+// adapters that need dependency-injected state (e.g. PluginToolDispatcher).
+// See ADR-001 (saldofanten-server _bmad-output/adr-001-llm-adapter-di-2026-04-06.md).
+// ---------------------------------------------------------------------------
+export function registerServerAdapter(adapter: ServerAdapterModule): void {
+  adaptersByType.set(adapter.type, adapter);
+}
