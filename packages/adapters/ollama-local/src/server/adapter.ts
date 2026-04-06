@@ -278,6 +278,7 @@ function extractRuntimeConfig(ctx: AdapterExecutionContext): OllamaLocalRuntimeC
     timeout_ms: typeof raw.timeout_ms === "number" ? raw.timeout_ms : undefined,
     max_iterations: typeof raw.max_iterations === "number" ? raw.max_iterations : undefined,
     api_key: typeof raw.api_key === "string" ? raw.api_key : undefined,
+    default_prompt: typeof raw.default_prompt === "string" ? raw.default_prompt : undefined,
   };
 }
 
