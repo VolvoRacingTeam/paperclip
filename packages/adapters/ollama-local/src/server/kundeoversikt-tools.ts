@@ -175,9 +175,26 @@ export async function executeKundeoversiktTool(
   switch (toolName) {
     case "kundeoversikt_list_unprocessed_emails": {
       const limit = typeof args.limit === "number" ? args.limit : 5;
-      return agentFetch(
+      const raw = await agentFetch(
         `/emails/unprocessed?organizationId=${orgId()}&limit=${limit}`,
-      );
+      ) as Record<string, unknown>;
+      // Truncate email bodies to prevent context overflow (llama.cpp 16K ctx)
+      if (raw.emails && Array.isArray(raw.emails)) {
+        raw.emails = (raw.emails as Array<Record<string, unknown>>).map((e) => ({
+          id: e.id,
+          subject: e.subject,
+          bodyText: typeof e.bodyText === "string" ? (e.bodyText as string).slice(0, 500) : "",
+          from: e.from,
+          fromName: e.fromName,
+          receivedAt: e.receivedAt,
+          customerId: e.customerId,
+          customerName: e.customerName,
+          graphConversationId: e.graphConversationId,
+          hasAttachments: e.hasAttachments,
+          // bodyHtml intentionally omitted — too large for context
+        }));
+      }
+      return raw;
     }
 
     case "kundeoversikt_get_customer_context": {
