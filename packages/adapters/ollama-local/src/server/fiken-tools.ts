@@ -396,7 +396,7 @@ export async function executeFikenTool(
         inboxDocumentId: args.inboxDocumentId ?? null,
         transactionDesc: args.transactionDesc ?? "",
         suggestedAccount: args.accountCode as string,
-        amountNok: args.amount as number,
+        amountNok: typeof args.amount === 'number' ? args.amount : 0,
         aiConfidence: typeof args.aiConfidence === "number" ? args.aiConfidence : 0.5,
         aiReasoning: (args.aiReasoning as string) ?? "",
         actorName: "paperclip-regnskapsforer",
