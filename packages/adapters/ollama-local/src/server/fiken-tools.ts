@@ -306,10 +306,14 @@ export async function executeFikenTool(
       if (to) path += `&toAccount=${to}`;
       const accounts = await fikenFetchAll(path) as Array<Record<string, unknown>>;
       if (!Array.isArray(accounts)) return accounts;
-      return accounts.map((a) => ({
-        code: a.code,
-        name: a.name,
-      }));
+      return {
+        count: accounts.length,
+        accounts: accounts.slice(0, 50).map((a) => ({
+          code: a.code,
+          name: a.name,
+        })),
+        hint: accounts.length > 50 ? "Bruk fromAccount/toAccount for �� filtrere (f.eks. 6000-7999 for driftskostnader)" : undefined,
+      };
     }
 
     case "fiken_get_journal_entries": {
