@@ -65,3 +65,13 @@ export {
   executeKundeoversiktTool,
   isKundeoversiktTool,
 } from "./kundeoversikt-tools.js";
+
+// ---------------------------------------------------------------------------
+// Fiken built-in tools (bookkeeping automation)
+// ---------------------------------------------------------------------------
+
+export {
+  FIKEN_TOOL_DEFINITIONS,
+  executeFikenTool,
+  isFikenTool,
+} from "./fiken-tools.js";

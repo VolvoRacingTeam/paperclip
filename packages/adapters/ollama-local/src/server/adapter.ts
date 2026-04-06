@@ -35,6 +35,11 @@ import {
   executeKundeoversiktTool,
   isKundeoversiktTool,
 } from "./kundeoversikt-tools.js";
+import {
+  FIKEN_TOOL_DEFINITIONS,
+  executeFikenTool,
+  isFikenTool,
+} from "./fiken-tools.js";
 
 // ---------------------------------------------------------------------------
 // Factory options
@@ -108,7 +113,7 @@ export async function executeAdapter(
     parametersSchema: d.parametersSchema,
   }));
   // Kundeoversikt built-in tools (email pipeline — see kundeoversikt-tools.ts)
-  const tools: ToolDefinition[] = [...pluginTools, ...KUNDEOVERSIKT_TOOL_DEFINITIONS];
+  const tools: ToolDefinition[] = [...pluginTools, ...KUNDEOVERSIKT_TOOL_DEFINITIONS, ...FIKEN_TOOL_DEFINITIONS];
 
   // Build a ToolExecutor that routes tool-calls to the right handler:
   // - Kundeoversikt built-in tools → executeKundeoversiktTool (HTTP)
@@ -117,6 +122,9 @@ export async function executeAdapter(
   const executeTool: ToolExecutor = async (name, args) => {
     if (isKundeoversiktTool(name)) {
       return executeKundeoversiktTool(name, args);
+    }
+    if (isFikenTool(name)) {
+      return executeFikenTool(name, args);
     }
     const execution = await dispatcher.executeTool(name, args, {
       agentId: ctx.agent.id,
