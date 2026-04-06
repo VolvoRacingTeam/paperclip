@@ -176,7 +176,7 @@ export async function executeKundeoversiktTool(
     case "kundeoversikt_list_unprocessed_emails": {
       const limit = typeof args.limit === "number" ? args.limit : 10;
       const raw = await agentFetch(
-        `/emails/unprocessed?organizationId=${orgId()}&limit=${limit}`,
+        `/emails/unprocessed?organizationId=${orgId()}&limit=${limit}&excludeClassificationMethods=rule_firma_sender`,
       ) as Record<string, unknown>;
       // Truncate email bodies to prevent context overflow (llama.cpp 16K ctx)
       if (raw.emails && Array.isArray(raw.emails)) {
