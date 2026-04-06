@@ -20,9 +20,7 @@ const FIKEN_BASE = "https://api.fiken.no/api/v2";
 
 function defaultFikenToken(): string {
   // Use first available token from env
-  const token = process.env.FIKEN_API_TOKEN
-    ?? process.env.FIKEN_API_KEY_1
-    ?? process.env.FIKEN_API_KEY;
+  const token = process.env.FIKEN_API_TOKEN;
   if (!token) throw new Error("Missing env: FIKEN_API_TOKEN or FIKEN_API_KEY_1");
   return token;
 }
