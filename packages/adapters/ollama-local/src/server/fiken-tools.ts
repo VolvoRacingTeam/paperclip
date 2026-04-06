@@ -247,16 +247,42 @@ export async function executeFikenTool(
       const slug = args.companySlug as string;
       if (!slug) return { error: "companySlug er påkrevd" };
       const unusedOnly = args.unusedOnly !== false; // default true
+
+      // Fetch all inbox documents
       const docs = await fikenFetchAll(`/companies/${slug}/inbox?sortBy=createdDate&descending=true`) as Array<Record<string, unknown>>;
       if (!Array.isArray(docs)) return docs;
+
       let filtered = docs;
       if (unusedOnly) {
+        // Cross-reference: fetch all purchases to find which inbox docs are used.
+        // Extract file UUIDs from purchase attachments and inbox documentUrls.
+        const purchases = await fikenFetchAll(`/companies/${slug}/purchases?sortBy=date&descending=true`) as Array<Record<string, unknown>>;
+        const usedFileUuids = new Set<string>();
+        if (Array.isArray(purchases)) {
+          for (const purchase of purchases) {
+            const atts = purchase.purchaseAttachments as Array<Record<string, unknown>> | undefined;
+            if (atts) {
+              for (const att of atts) {
+                const url = att.downloadUrl as string;
+                if (url) {
+                  // Extract UUID from URL: .../files/{uuid}/filename
+                  const match = url.match(/\/files\/([0-9a-f-]{36})\//) ;
+                  if (match) usedFileUuids.add(match[1]);
+                }
+              }
+            }
+          }
+        }
+
         filtered = docs.filter((d) => {
-          const links = d.links as Array<Record<string, unknown>> | undefined;
-          if (!links) return true;
-          return !links.some((l) => l.rel === "purchase" || l.rel === "journalEntry");
+          const docUrl = d.documentUrl as string;
+          if (!docUrl) return true; // no URL = assume unused
+          const match = docUrl.match(/\/files\/([0-9a-f-]{36})\//) ;
+          if (!match) return true;
+          return !usedFileUuids.has(match[1]);
         });
       }
+
       return {
         total: docs.length,
         unused: filtered.length,
@@ -265,7 +291,7 @@ export async function executeFikenTool(
           name: d.name,
           description: d.description,
           filename: d.filename,
-          createdDate: d.createdDate,
+          createdDate: d.createdAt ?? d.createdDate,
         })),
       };
     }
