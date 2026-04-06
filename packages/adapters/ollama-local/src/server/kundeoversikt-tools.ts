@@ -174,7 +174,7 @@ export async function executeKundeoversiktTool(
 ): Promise<unknown> {
   switch (toolName) {
     case "kundeoversikt_list_unprocessed_emails": {
-      const limit = typeof args.limit === "number" ? args.limit : 5;
+      const limit = typeof args.limit === "number" ? args.limit : 1;
       const raw = await agentFetch(
         `/emails/unprocessed?organizationId=${orgId()}&limit=${limit}`,
       ) as Record<string, unknown>;
@@ -183,7 +183,7 @@ export async function executeKundeoversiktTool(
         raw.emails = (raw.emails as Array<Record<string, unknown>>).map((e) => ({
           id: e.id,
           subject: e.subject,
-          bodyText: typeof e.bodyText === "string" ? (e.bodyText as string).slice(0, 1500) : "",
+          bodyText: typeof e.bodyText === "string" ? (e.bodyText as string).slice(0, 4000) : "",
           from: e.from,
           fromName: e.fromName,
           receivedAt: e.receivedAt,
