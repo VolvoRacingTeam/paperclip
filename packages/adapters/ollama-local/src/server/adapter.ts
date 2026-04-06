@@ -30,6 +30,11 @@ import type {
   ToolDescriptorLike,
   ToolResultLike,
 } from "./tool-dispatcher-contract.js";
+import {
+  KUNDEOVERSIKT_TOOL_DEFINITIONS,
+  executeKundeoversiktTool,
+  isKundeoversiktTool,
+} from "./kundeoversikt-tools.js";
 
 // ---------------------------------------------------------------------------
 // Factory options
@@ -86,19 +91,24 @@ export async function executeAdapter(
     );
   }
 
-  // Discover plugin tools. The ollama_local adapter does NOT filter by
-  // plugin — all tools the agent has access to are exposed to the model.
+  // Discover plugin tools + inject Kundeoversikt built-in tools.
   const descriptors: ToolDescriptorLike[] = dispatcher.listToolsForAgent();
-  const tools: ToolDefinition[] = descriptors.map((d) => ({
+  const pluginTools: ToolDefinition[] = descriptors.map((d) => ({
     name: d.name,
     description: d.description,
     parametersSchema: d.parametersSchema,
   }));
+  // Kundeoversikt built-in tools (email pipeline — see kundeoversikt-tools.ts)
+  const tools: ToolDefinition[] = [...pluginTools, ...KUNDEOVERSIKT_TOOL_DEFINITIONS];
 
-  // Build a ToolExecutor that routes every model tool-call through the
-  // real dispatcher with the correct run context.
+  // Build a ToolExecutor that routes tool-calls to the right handler:
+  // - Kundeoversikt built-in tools → executeKundeoversiktTool (HTTP)
+  // - All other tools → PluginToolDispatcher (plugin workers)
   const projectId = extractProjectId(ctx);
   const executeTool: ToolExecutor = async (name, args) => {
+    if (isKundeoversiktTool(name)) {
+      return executeKundeoversiktTool(name, args);
+    }
     const execution = await dispatcher.executeTool(name, args, {
       agentId: ctx.agent.id,
       runId: ctx.runId,

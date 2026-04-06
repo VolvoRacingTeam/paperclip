@@ -55,3 +55,13 @@ export type {
   ToolResultLike,
   ToolExecutionResultLike,
 } from "./tool-dispatcher-contract.js";
+
+// ---------------------------------------------------------------------------
+// Kundeoversikt built-in tools (email pipeline)
+// ---------------------------------------------------------------------------
+
+export {
+  KUNDEOVERSIKT_TOOL_DEFINITIONS,
+  executeKundeoversiktTool,
+  isKundeoversiktTool,
+} from "./kundeoversikt-tools.js";
