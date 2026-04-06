@@ -183,7 +183,7 @@ export async function executeKundeoversiktTool(
         raw.emails = (raw.emails as Array<Record<string, unknown>>).map((e) => ({
           id: e.id,
           subject: e.subject,
-          bodyText: typeof e.bodyText === "string" ? (e.bodyText as string).slice(0, 500) : "",
+          bodyText: typeof e.bodyText === "string" ? (e.bodyText as string).slice(0, 1500) : "",
           from: e.from,
           fromName: e.fromName,
           receivedAt: e.receivedAt,
