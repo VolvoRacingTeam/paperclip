@@ -25,6 +25,7 @@ export interface OllamaLocalRuntimeConfig {
   timeout_ms?: number;
   max_iterations?: number;
   api_key?: string;
+  default_prompt?: string;
 }
 
 export interface ExecuteOllamaLocalOptions {

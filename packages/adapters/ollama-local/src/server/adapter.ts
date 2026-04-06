@@ -80,15 +80,24 @@ export async function executeAdapter(
   dispatcher: PluginToolDispatcherLike,
 ): Promise<AdapterExecutionResult> {
   const runtimeConfig = extractRuntimeConfig(ctx);
-  const userMessage = extractUserMessage(ctx);
+  let userMessage = extractUserMessage(ctx);
   const systemPrompt = extractSystemPrompt(ctx);
 
+  // For heartbeat runs, Paperclip doesn't inject a user message.
+  // Fall back to default_prompt from adapter_config.
   if (!userMessage) {
-    return failResult(
-      ctx,
-      "no_user_message",
-      "Adapter received no user message; refusing to call the model.",
-    );
+    const defaultPrompt = typeof runtimeConfig.default_prompt === "string"
+      ? runtimeConfig.default_prompt
+      : undefined;
+    if (defaultPrompt) {
+      userMessage = defaultPrompt;
+    } else {
+      return failResult(
+        ctx,
+        "no_user_message",
+        "Adapter received no user message and no default_prompt in adapter_config.",
+      );
+    }
   }
 
   // Discover plugin tools + inject Kundeoversikt built-in tools.
