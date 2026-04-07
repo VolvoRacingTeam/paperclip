@@ -154,20 +154,22 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "kundeoversikt_log_action",
     description:
-      "Logg en handling i Kundeoversikt. Brukes for sporbarhet og audit-trail. " +
-      "Logg ALLE handlinger: klassifisering, prospect-opprettelse, routing, draft-opprettelse.",
+      "Logg en handling i Kundeoversikt (POST /api/agent/actions/log). " +
+      "Brukes for sporbarhet og audit-trail. " +
+      "Logg ALLE handlinger: klassifisering, prospect-opprettelse, routing, draft-opprettelse. " +
+      "Bruk emailLogId og customerId fra listen over ubehandlede e-poster.",
     parametersSchema: {
       type: "object",
       properties: {
         actionType: { type: "string", description: "Type handling: 'classify_email', 'create_prospect', 'route_to_agent', 'draft_reply', 'skip_system_email'." },
-        actionSummary: { type: "string", description: "Menneskelig lesbar beskrivelse av handlingen." },
-        emailLogId: { type: "string", description: "UUID for e-posten (valgfri)." },
-        customerId: { type: "string", description: "UUID for kunden (valgfri)." },
-        prospectId: { type: "string", description: "UUID for prospect (valgfri)." },
-        resultStatus: { type: "string", enum: ["pending", "completed", "failed", "needs_human"], description: "Resultat-status." },
-        resultSummary: { type: "string", description: "Hva ble resultatet." },
+        actionSummary: { type: "string", description: "Menneskelig lesbar beskrivelse av handlingen (1-2 setninger)." },
+        emailLogId: { type: "string", description: "UUID for e-posten som handlingen gjelder. Hentes fra emailLogId i list_unprocessed_emails." },
+        customerId: { type: "string", description: "UUID for kunden. Hentes fra customerId i list_unprocessed_emails." },
+        resultSummary: { type: "string", description: "Kort oppsummering av resultatet av handlingen." },
+        actionDetails: { type: "object", description: "Valgfri: ekstra strukturert data om handlingen (nøkkel-verdi)." },
+        prospectId: { type: "string", description: "Valgfri: UUID for prospect (kun ved prospect-relaterte handlinger)." },
       },
-      required: ["actionType", "actionSummary", "resultStatus"],
+      required: ["actionType", "actionSummary", "emailLogId", "customerId", "resultSummary"],
       additionalProperties: false,
     },
   },
@@ -298,19 +300,18 @@ export async function executeKundeoversiktTool(
     }
 
     case "kundeoversikt_log_action": {
-      return agentFetch("/actions", {
+      return agentFetch("/actions/log", {
         method: "POST",
         body: JSON.stringify({
           organizationId: orgId(),
           actorName: "paperclip-email-assistant",
           actionType: args.actionType,
           actionSummary: args.actionSummary,
-          actionDetails: args.actionDetails ?? null,
-          emailLogId: args.emailLogId ?? null,
-          customerId: args.customerId ?? null,
-          prospectId: args.prospectId ?? null,
-          resultStatus: args.resultStatus ?? "completed",
-          resultSummary: args.resultSummary ?? null,
+          emailLogId: args.emailLogId,
+          customerId: args.customerId,
+          resultSummary: args.resultSummary,
+          actionDetails: args.actionDetails ?? undefined,
+          prospectId: args.prospectId ?? undefined,
         }),
       });
     }
