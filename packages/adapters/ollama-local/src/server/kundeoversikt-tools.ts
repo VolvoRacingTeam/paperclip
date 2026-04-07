@@ -241,7 +241,7 @@ export async function executeKundeoversiktTool(
       ) as Record<string, unknown>;
       if (raw.emails && Array.isArray(raw.emails)) {
         raw.emails = (raw.emails as Array<Record<string, unknown>>).map((e) => ({
-          id: e.id,
+          emailLogId: e.id,
           subject: e.subject,
           bodyText: typeof e.bodyText === "string" ? (e.bodyText as string).slice(0, 2000) : "",
           from: e.from,
