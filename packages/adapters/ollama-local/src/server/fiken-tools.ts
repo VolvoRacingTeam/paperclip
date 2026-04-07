@@ -380,7 +380,7 @@ export async function executeFikenTool(
       const body = {
         organizationId: orgId,
         companySlug: args.companySlug,
-        customerId: args.customerId ?? null,
+        customerId: args.customerId ?? undefined,
         bookingType: args.bookingType ?? "purchase",
         fikenPayload: {
           date: args.date,
