@@ -225,6 +225,46 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+
+  // === 9. Get draft feedback ===
+  {
+    name: "kundeoversikt_get_draft_feedback",
+    description:
+      "Hent Tores tidligere redigeringer av agent-utkast. " +
+      "Bruk dette FØR create_draft_reply for å tilpasse tone og stil.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        customerId: { type: "string", description: "UUID for kunden (valgfri)." },
+        contentCategory: { type: "string", description: "Innholdstype-filter (valgfri)." },
+        limit: { type: "integer", description: "Maks antall (standard 5).", minimum: 1, maximum: 50 },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+
+  // === 10. Upsert email summary ===
+  {
+    name: "kundeoversikt_upsert_email_summary",
+    description:
+      "Opprett eller oppdater sammendrag for en e-posttråd. " +
+      "Kall dette etter klassifisering eller etter at svar er sendt.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        conversationId: { type: "string", description: "graph_conversation_id fra e-posten." },
+        customerId: { type: "string", description: "UUID for kunden (valgfri)." },
+        summaryText: { type: "string", description: "Kort oppsummering av tråden." },
+        status: { type: "string", description: "Presis status, f.eks. 'Venter på svar fra Daniel Herigstad (Nextify Media)'." },
+        keyPoints: { type: "array", items: { type: "string" }, description: "Nøkkelpunkter fra samtalen." },
+        messageCount: { type: "integer", description: "Totalt antall meldinger i tråden.", minimum: 1 },
+        lastMessageId: { type: "string", description: "ID for siste melding." },
+      },
+      required: ["conversationId", "summaryText", "status", "keyPoints", "messageCount", "lastMessageId"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -343,6 +383,35 @@ export async function executeKundeoversiktTool(
       const status = typeof args.status === "string" ? `&status=${args.status}` : "";
       const limit = typeof args.limit === "number" ? args.limit : 20;
       return agentFetch(`/prospects?organizationId=${orgId()}&limit=${limit}${status}`);
+    }
+
+
+    case "kundeoversikt_get_draft_feedback": {
+      const params = new URLSearchParams();
+      params.set("organizationId", orgId());
+      if (typeof args.customerId === "string") params.set("customerId", args.customerId);
+      if (typeof args.contentCategory === "string") params.set("contentCategory", args.contentCategory);
+      const limit = typeof args.limit === "number" ? args.limit : 5;
+      params.set("limit", String(limit));
+      return agentFetch(`/draft-feedback?${params.toString()}`);
+    }
+
+    case "kundeoversikt_upsert_email_summary": {
+      const conversationId = args.conversationId as string;
+      if (!conversationId) return { error: "conversationId er påkrevd" };
+      return agentFetch("/email-summaries", {
+        method: "POST",
+        body: JSON.stringify({
+          organizationId: orgId(),
+          conversationId: args.conversationId,
+          customerId: args.customerId ?? null,
+          summaryText: args.summaryText,
+          status: args.status,
+          keyPoints: args.keyPoints,
+          messageCount: args.messageCount,
+          lastMessageId: args.lastMessageId,
+        }),
+      });
     }
 
     default:
