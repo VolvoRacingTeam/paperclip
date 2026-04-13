@@ -6,8 +6,8 @@
  * Kundeoversikt credentials endpoint.
  *
  * Environment variables:
- *   FIKEN_API_TOKEN — Default Fiken bearer token (for Verkvelven's own companies)
- *   AGENT_API_KEY   — For fetching per-company tokens from Kundeoversikt
+ *   FIKEN_API_TOKEN â€” Default Fiken bearer token (for Verkvelven's own companies)
+ *   AGENT_API_KEY   â€” For fetching per-company tokens from Kundeoversikt
  */
 
 import type { ToolDefinition } from "./schema.js";
@@ -111,8 +111,8 @@ export const FIKEN_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "fiken_get_inbox",
     description:
       "Hent innboks-bilag for et selskap i Fiken. " +
-      "Returnerer bilag med beskrivelse, beløp, dato, leverandør. " +
-      "Sett unusedOnly=true for å kun se bilag som ikke er bokført ennå.",
+      "Returnerer bilag med beskrivelse, belÃ¸p, dato, leverandÃ¸r. " +
+      "Sett unusedOnly=true for Ã¥ kun se bilag som ikke er bokfÃ¸rt ennÃ¥.",
     parametersSchema: {
       type: "object",
       properties: {
@@ -129,7 +129,7 @@ export const FIKEN_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "fiken_get_accounts",
     description:
       "Hent kontoplan for et selskap. Returnerer kontonummer, navn og type. " +
-      "Bruk for å finne riktig konto ved bokføring.",
+      "Bruk for Ã¥ finne riktig konto ved bokfÃ¸ring.",
     parametersSchema: {
       type: "object",
       properties: {
@@ -147,7 +147,7 @@ export const FIKEN_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "fiken_get_journal_entries",
     description:
       "Hent journalposter (inkludert banktransaksjoner) for et selskap. " +
-      "Filtrer på dato. Bruk for å finne uavstemte bankposter.",
+      "Filtrer pÃ¥ dato. Bruk for Ã¥ finne uavstemte bankposter.",
     parametersSchema: {
       type: "object",
       properties: {
@@ -161,17 +161,17 @@ export const FIKEN_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
-  // === 5. Get contacts (leverandører/kunder) ===
+  // === 5. Get contacts (leverandÃ¸rer/kunder) ===
   {
     name: "fiken_get_contacts",
     description:
-      "Hent kontakter (leverandører og kunder) for et selskap i Fiken. " +
-      "Bruk for å finne leverandør-ID ved bokføring.",
+      "Hent kontakter (leverandÃ¸rer og kunder) for et selskap i Fiken. " +
+      "Bruk for Ã¥ finne leverandÃ¸r-ID ved bokfÃ¸ring.",
     parametersSchema: {
       type: "object",
       properties: {
         companySlug: { type: "string", description: "Selskapets slug." },
-        supplierOnly: { type: "boolean", description: "Kun leverandører (standard: false)." },
+        supplierOnly: { type: "boolean", description: "Kun leverandÃ¸rer (standard: false)." },
       },
       required: ["companySlug"],
       additionalProperties: false,
@@ -197,18 +197,18 @@ export const FIKEN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "fiken_submit_bookkeeping",
     description:
-      "Send et bokføringsforslag til Tores godkjenningskø i Kundeoversikt. " +
-      "Tore godkjenner eller avviser. Godkjente poster bokføres automatisk i Fiken. " +
-      "ALDRI bokfør direkte — alt MÅ gå gjennom godkjenningskøen.",
+      "Send et bokfÃ¸ringsforslag til Tores godkjenningskÃ¸ i Kundeoversikt. " +
+      "Tore godkjenner eller avviser. Godkjente poster bokfÃ¸res automatisk i Fiken. " +
+      "ALDRI bokfÃ¸r direkte â€” alt MÃ… gÃ¥ gjennom godkjenningskÃ¸en.",
     parametersSchema: {
       type: "object",
       properties: {
         companySlug: { type: "string", description: "Selskapets slug." },
         customerId: { type: "string", description: "Kunde-UUID i Kundeoversikt (valgfri)." },
-        bookingType: { type: "string", enum: ["purchase", "journal_entry"], description: "Type bokføring." },
-        date: { type: "string", description: "Bokføringsdato (YYYY-MM-DD)." },
+        bookingType: { type: "string", enum: ["purchase", "journal_entry"], description: "Type bokfÃ¸ring." },
+        date: { type: "string", description: "BokfÃ¸ringsdato (YYYY-MM-DD)." },
         accountCode: { type: "string", description: "Kontokode (f.eks. '6340')." },
-        amount: { type: "number", description: "Beløp i NOK (positiv)." },
+        amount: { type: "number", description: "BelÃ¸p i NOK (positiv)." },
         vatType: { type: "string", enum: ["HIGH", "MEDIUM", "LOW", "NONE", "EXEMPT"], description: "MVA-type." },
         description: { type: "string", description: "Beskrivelse av bilaget." },
         inboxDocumentId: { type: "integer", description: "Fiken innboks-bilag-ID (hvis matcher)." },
@@ -245,7 +245,7 @@ export async function executeFikenTool(
 
     case "fiken_get_inbox": {
       const slug = args.companySlug as string;
-      if (!slug) return { error: "companySlug er påkrevd" };
+      if (!slug) return { error: "companySlug er pÃ¥krevd" };
       const unusedOnly = args.unusedOnly !== false; // default true
 
       // Fetch all inbox documents
@@ -298,7 +298,7 @@ export async function executeFikenTool(
 
     case "fiken_get_accounts": {
       const slug = args.companySlug as string;
-      if (!slug) return { error: "companySlug er påkrevd" };
+      if (!slug) return { error: "companySlug er pÃ¥krevd" };
       const from = typeof args.fromAccount === "number" ? args.fromAccount : undefined;
       const to = typeof args.toAccount === "number" ? args.toAccount : undefined;
       let path = `/companies/${slug}/accounts?pageSize=200`;
@@ -312,13 +312,13 @@ export async function executeFikenTool(
           code: a.code,
           name: a.name,
         })),
-        hint: accounts.length > 50 ? "Bruk fromAccount/toAccount for �� filtrere (f.eks. 6000-7999 for driftskostnader)" : undefined,
+        hint: accounts.length > 50 ? "Bruk fromAccount/toAccount for ï¿½ï¿½ filtrere (f.eks. 6000-7999 for driftskostnader)" : undefined,
       };
     }
 
     case "fiken_get_journal_entries": {
       const slug = args.companySlug as string;
-      if (!slug) return { error: "companySlug er påkrevd" };
+      if (!slug) return { error: "companySlug er pÃ¥krevd" };
       const from = (args.fromDate as string) ?? new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
       const to = (args.toDate as string) ?? new Date().toISOString().slice(0, 10);
       const page = typeof args.page === "number" ? args.page : 0;
@@ -339,7 +339,7 @@ export async function executeFikenTool(
 
     case "fiken_get_contacts": {
       const slug = args.companySlug as string;
-      if (!slug) return { error: "companySlug er påkrevd" };
+      if (!slug) return { error: "companySlug er pÃ¥krevd" };
       const contacts = await fikenFetchAll(`/companies/${slug}/contacts`) as Array<Record<string, unknown>>;
       if (!Array.isArray(contacts)) return contacts;
       let filtered = contacts;
@@ -358,7 +358,7 @@ export async function executeFikenTool(
 
     case "fiken_get_bank_accounts": {
       const slug = args.companySlug as string;
-      if (!slug) return { error: "companySlug er påkrevd" };
+      if (!slug) return { error: "companySlug er pÃ¥krevd" };
       const accounts = await fikenFetchAll(`/companies/${slug}/bankAccounts`) as Array<Record<string, unknown>>;
       if (!Array.isArray(accounts)) return accounts;
       return accounts.map((a) => ({
@@ -371,7 +371,22 @@ export async function executeFikenTool(
     }
 
     case "fiken_submit_bookkeeping": {
-      // Route to Kundeoversikt bookkeeping queue — NOT directly to Fiken
+
+      // Accept documentId as alias for inboxDocumentId (Gemma 4 guesses wrong name)
+      if (args.inboxDocumentId === undefined && args.documentId !== undefined) {
+        args = { ...args, inboxDocumentId: args.documentId };
+      }
+
+      // Validate required fields — return helpful error so agent retries with correct data
+      const _missing: string[] = [];
+      if (typeof args.amount !== 'number') _missing.push('amount (beloep i NOK, f.eks. 299.00)');
+      if (!args.date) _missing.push('date (bokforingsdato YYYY-MM-DD)');
+      if (!args.vatType) _missing.push('vatType (NONE/HIGH/MEDIUM/LOW/EXEMPT)');
+      if (!args.description) _missing.push('description (bilagets filnavn/navn)');
+      if (_missing.length > 0) {
+        return { error: 'fiken_submit_bookkeeping mangler obligatoriske felter: ' + _missing.join(', ') + '. Send alle felter pa nytt.' };
+      }
+      // Route to Kundeoversikt bookkeeping queue â€” NOT directly to Fiken
       const baseUrl = (process.env.KUNDEOVERSIKT_DRAFTS_URL ?? "https://www.kundeoversikt.no/api/agent/drafts").replace(/\/drafts$/, "");
       const apiKey = process.env.AGENT_API_KEY;
       const orgId = process.env.KUNDEOVERSIKT_ORG_ID;
@@ -387,7 +402,7 @@ export async function executeFikenTool(
           kind: "cash_purchase",
           lines: [{
             accountCode: args.accountCode,
-            amount: Math.round((args.amount as number) * 100), // NOK → øre
+            amount: Math.round((args.amount as number) * 100), // NOK â†’ Ã¸re
             vatType: args.vatType,
             description: args.description,
           }],
@@ -425,7 +440,7 @@ export async function executeFikenTool(
     }
 
     default:
-      return { error: `Ukjent Fiken-verktøy: ${toolName}` };
+      return { error: `Ukjent Fiken-verktÃ¸y: ${toolName}` };
   }
 }
 
