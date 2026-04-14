@@ -1152,7 +1152,7 @@ export function heartbeatService(db: Db) {
     return {
       route,
       providerKey: deriveProviderUsageKey(route),
-      modelUsed: route.policyModel,
+      modelUsed: route.runtimeModel,
       fallbackReason: route.fallbackReason,
       usageDate,
     };
