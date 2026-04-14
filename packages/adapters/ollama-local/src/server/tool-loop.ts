@@ -61,6 +61,40 @@ export type ToolLoopLogEvent =
   | { type: "parse_error"; iteration: number; error: string }
   | { type: "escalation"; reason: string; detail?: string };
 
+function extractErrorMessage(result: unknown): string | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+  const value = (result as { error?: unknown }).error;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeErrorPayload(payload: string): string {
+  try {
+    return JSON.stringify(JSON.parse(payload));
+  } catch {
+    return payload.replace(/\s+/g, " ").trim();
+  }
+}
+
+function getRepeatedErrorSignature(
+  tool: string,
+  result: unknown,
+  caughtError: boolean,
+): string | null {
+  const message = extractErrorMessage(result);
+  if (!message) {
+    return caughtError ? `${tool}::unknown_error` : null;
+  }
+
+  const httpMatch = message.match(/^HTTP\s+(\d+):\s*(.*)$/s);
+  if (httpMatch) {
+    return `${tool}::HTTP ${httpMatch[1]}::${normalizeErrorPayload(httpMatch[2] ?? "")}`;
+  }
+
+  return `${tool}::${normalizeErrorPayload(message)}`;
+}
+
 const DEFAULT_SYSTEM_PROMPT = [
   "Du er en AI-agent i Paperclip-systemet hos Verkvelven AS.",
   "Språk: norsk (bokmål). Du MÅ svare på norsk.",
@@ -108,6 +142,8 @@ export async function runToolLoop(
   ];
 
   const steps: ToolLoopStep[] = [];
+  let previousErrorSignature: string | null = null;
+  let repeatedErrorCount = 0;
   const usage: ToolLoopUsage = {
     promptTokens: 0,
     completionTokens: 0,
@@ -192,13 +228,19 @@ export async function runToolLoop(
     });
 
     let result: unknown;
-    let isError = false;
+    let caughtError = false;
     try {
       result = await ctx.executeTool(parsed.tool, parsed.arguments);
     } catch (err) {
-      isError = true;
+      caughtError = true;
       result = { error: (err as Error).message };
     }
+    const repeatedErrorSignature = getRepeatedErrorSignature(
+      parsed.tool,
+      result,
+      caughtError,
+    );
+    const isError = repeatedErrorSignature !== null;
 
     ctx.onLog?.({
       type: "tool_result",
@@ -214,6 +256,36 @@ export async function runToolLoop(
       result,
       isError,
     });
+
+    if (repeatedErrorSignature) {
+      if (repeatedErrorSignature === previousErrorSignature) {
+        repeatedErrorCount += 1;
+      } else {
+        previousErrorSignature = repeatedErrorSignature;
+        repeatedErrorCount = 1;
+      }
+
+      if (repeatedErrorCount >= 2) {
+        const detail = `Repeated tool error for ${parsed.tool} ${repeatedErrorCount} times in a row: ${extractErrorMessage(result) ?? "unknown error"}`;
+        ctx.onLog?.({
+          type: "escalation",
+          reason: "repeated_tool_error",
+          detail,
+        });
+        return {
+          finalAnswer: "",
+          steps,
+          usage,
+          escalated: {
+            reason: "repeated_tool_error",
+            detail,
+          },
+        };
+      }
+    } else {
+      previousErrorSignature = null;
+      repeatedErrorCount = 0;
+    }
 
     messages.push({ role: "assistant", content: resp.content });
     messages.push({

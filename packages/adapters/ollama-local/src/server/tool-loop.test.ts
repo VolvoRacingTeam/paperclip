@@ -207,4 +207,48 @@ describe("runToolLoop", () => {
 
     expect(result.escalated?.reason).toBe("max_iterations_reached");
   });
+
+
+  it("escalates after two identical tool errors in a row", async () => {
+    const client = makeStubClient([
+      JSON.stringify({
+        reasoning: "Pr?v innsending for f?rste bilag",
+        tool_call: {
+          tool: "fiken_submit_bookkeeping",
+          arguments: { invoiceId: "bilag-1" },
+        },
+      }),
+      JSON.stringify({
+        reasoning: "Pr?v innsending for neste bilag",
+        tool_call: {
+          tool: "fiken_submit_bookkeeping",
+          arguments: { invoiceId: "bilag-2" },
+        },
+      }),
+    ]);
+
+    const result = await runToolLoop(client, {
+      userMessage: "Send to bilag",
+      tools: [
+        {
+          name: "fiken_submit_bookkeeping",
+          description: "Submit bookkeeping to queue",
+          parametersSchema: {
+            type: "object",
+            properties: { invoiceId: { type: "string" } },
+            required: ["invoiceId"],
+          },
+        },
+      ],
+      executeTool: async () => ({
+        error: 'HTTP 500: {"error":"Failed to create queue item"}',
+      }),
+      maxIterations: 5,
+    });
+
+    expect(result.steps).toHaveLength(2);
+    expect(result.steps.every((step) => step.isError)).toBe(true);
+    expect(result.escalated?.reason).toBe("repeated_tool_error");
+    expect(result.escalated?.detail).toContain("Failed to create queue item");
+  });
 });
