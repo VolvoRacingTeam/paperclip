@@ -7,6 +7,9 @@ import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
   agents,
+  agentBudgetPolicies,
+  agentDailyTokenUsage,
+  agentRunFailures,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
@@ -59,12 +62,32 @@ import {
   resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import { createAlertTransport } from "./alert-transport.js";
+import {
+  buildFallbackRequest,
+  buildPrimaryRetryContext,
+  buildRoutedPolicy,
+  classifyAdapterFailure,
+  clearRetryRoutingContext,
+  DEFAULT_POLICY_TIMEZONE,
+  formatDateInTimezone,
+  readFallbackRequest,
+  resolveTransportTimeoutRetryCount,
+  resolveWorkflowName,
+  selectExecutionRoute,
+  type RoutedExecution,
+  type RoutedFailureSignal,
+  type RoutedFallbackReason,
+} from "./model-routing.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const FAILURE_DEDUPE_WINDOW_SECONDS = 900;
+const CONSECUTIVE_FAILURE_ALERT_THRESHOLD = 4;
+const MONITOR_STALE_MS = 5 * 60 * 1000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -302,6 +325,21 @@ type UsageTotals = {
   outputTokens: number;
 };
 
+type ExecutionAttemptSummary = {
+  route: RoutedExecution;
+  providerKey: string;
+  modelUsed: string;
+  fallbackReason: RoutedFallbackReason | null;
+  usageDate: string;
+};
+
+type MonitorState = {
+  lastSchedulerTickAt: number | null;
+  lastDryRunSignature: string | null;
+  lastDryRunGrowthAt: number | null;
+  dedupeWindows: Map<string, number>;
+};
+
 type SessionCompactionDecision = {
   rotate: boolean;
   reason: string | null;
@@ -489,6 +527,19 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
     cachedInputTokens,
     outputTokens,
   };
+}
+
+function totalTokensForUsage(usage: UsageTotals | null | undefined) {
+  if (!usage) return 0;
+  return usage.inputTokens + usage.cachedInputTokens + usage.outputTokens;
+}
+
+function deriveProviderUsageKey(route: RoutedExecution) {
+  return route.adapterType === "claude_local" ? "claude_local" : "ollama_local";
+}
+
+function normalizeFailureBucket(now: Date, windowSeconds: number) {
+  return Math.floor(now.getTime() / 1000 / windowSeconds);
 }
 
 function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: UsageTotals | null): UsageTotals | null {
@@ -865,6 +916,193 @@ export function heartbeatService(db: Db) {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  const alertTransport = createAlertTransport();
+  const monitorState: MonitorState = {
+    lastSchedulerTickAt: null,
+    lastDryRunSignature: null,
+    lastDryRunGrowthAt: null,
+    dedupeWindows: new Map(),
+  };
+
+  async function sendOperationalAlert(input: {
+    key: string;
+    severity: "warning" | "critical";
+    title: string;
+    message: string;
+    dedupeWindowMs: number;
+    details?: Record<string, unknown>;
+  }) {
+    const now = Date.now();
+    const nextAllowedAt = monitorState.dedupeWindows.get(input.key) ?? 0;
+    if (nextAllowedAt > now) return false;
+
+    try {
+      await alertTransport.send({
+        key: input.key,
+        severity: input.severity,
+        title: input.title,
+        message: input.message,
+        dedupeKey: input.key,
+        details: input.details,
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, alertKey: input.key, severity: input.severity },
+        "failed to deliver operational alert",
+      );
+      return false;
+    }
+    monitorState.dedupeWindows.set(input.key, now + input.dedupeWindowMs);
+    return true;
+  }
+
+  async function getAgentPolicyRow(agentId: string, workflowName: string) {
+    const rows = await db
+      .select()
+      .from(agentBudgetPolicies)
+      .where(eq(agentBudgetPolicies.agentId, agentId));
+    return (
+      rows.find((row) => row.workflowName === workflowName) ??
+      rows.find((row) => row.workflowName === "*") ??
+      rows[0] ??
+      null
+    );
+  }
+
+  async function getPrimaryTokensUsedToday(agentId: string, usageDate: string, provider: string) {
+    const [row] = await db
+      .select({
+        totalTokens: sql<number>`coalesce(sum(${agentDailyTokenUsage.totalTokens}), 0)::int`,
+      })
+      .from(agentDailyTokenUsage)
+      .where(
+        and(
+          eq(agentDailyTokenUsage.agentId, agentId),
+          eq(agentDailyTokenUsage.usageDate, usageDate),
+          eq(agentDailyTokenUsage.provider, provider),
+        ),
+      );
+    return Number(row?.totalTokens ?? 0);
+  }
+
+  async function recordDailyTokenUsage(input: {
+    agentId: string;
+    provider: string;
+    usageDate: string;
+    heartbeatRunId: string;
+    usage: UsageTotals | null;
+  }) {
+    const usage = input.usage;
+    if (!usage || totalTokensForUsage(usage) <= 0) return;
+
+    const promptTokens = usage.inputTokens + usage.cachedInputTokens;
+    const completionTokens = usage.outputTokens;
+    const totalTokens = promptTokens + completionTokens;
+
+    await db
+      .insert(agentDailyTokenUsage)
+      .values({
+        agentId: input.agentId,
+        usageDate: input.usageDate,
+        provider: input.provider,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        lastRunId: input.heartbeatRunId,
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [
+          agentDailyTokenUsage.agentId,
+          agentDailyTokenUsage.usageDate,
+          agentDailyTokenUsage.provider,
+        ],
+        set: {
+          promptTokens: sql`${agentDailyTokenUsage.promptTokens} + ${promptTokens}`,
+          completionTokens: sql`${agentDailyTokenUsage.completionTokens} + ${completionTokens}`,
+          totalTokens: sql`${agentDailyTokenUsage.totalTokens} + ${totalTokens}`,
+          lastRunId: input.heartbeatRunId,
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  async function recordRunFailureFingerprint(input: {
+    agentId: string;
+    workflowName: string;
+    signal: RoutedFailureSignal;
+    targetRef?: string | null;
+  }) {
+    const now = new Date();
+    const dedupeWindowBucket = normalizeFailureBucket(now, FAILURE_DEDUPE_WINDOW_SECONDS);
+    await db
+      .insert(agentRunFailures)
+      .values({
+        agentId: input.agentId,
+        workflow: input.workflowName,
+        windowSeconds: FAILURE_DEDUPE_WINDOW_SECONDS,
+        dedupeWindowBucket,
+        errorSource: "adapter",
+        errorClass: input.signal.errorClass,
+        errorCode: input.signal.errorCode,
+        httpStatus: input.signal.httpStatus,
+        targetRef: input.targetRef ?? null,
+        normalizedMessage: input.signal.normalizedMessage,
+        errorFingerprint: input.signal.errorFingerprint,
+        hitCount: 1,
+        firstSeenAt: now,
+        lastSeenAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [
+          agentRunFailures.agentId,
+          agentRunFailures.workflow,
+          agentRunFailures.errorFingerprint,
+          agentRunFailures.dedupeWindowBucket,
+        ],
+        set: {
+          hitCount: sql`${agentRunFailures.hitCount} + 1`,
+          lastSeenAt: now,
+          errorCode: input.signal.errorCode,
+          httpStatus: input.signal.httpStatus,
+          targetRef: input.targetRef ?? null,
+          normalizedMessage: input.signal.normalizedMessage,
+        },
+      });
+  }
+
+  async function alertIfConsecutiveFailures(agentId: string) {
+    const agent = await getAgent(agentId);
+    if (!agent) return;
+
+    const recentRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(CONSECUTIVE_FAILURE_ALERT_THRESHOLD);
+
+    if (recentRuns.length < CONSECUTIVE_FAILURE_ALERT_THRESHOLD) return;
+    if (!recentRuns.every((run) => run.status === "failed" || run.status === "timed_out")) return;
+
+    const latest = recentRuns[0];
+    await sendOperationalAlert({
+      key: `consecutive_failures:${agentId}`,
+      severity: "critical",
+      title: `Paperclip: ${agent.name} feiler gjentatt`,
+      message: `${agent.name} har feilet ${recentRuns.length} ganger på rad. Siste feil: ${latest?.errorCode ?? latest?.error ?? "ukjent feil"}`,
+      dedupeWindowMs: FAILURE_DEDUPE_WINDOW_SECONDS * 1000,
+      details: {
+        agentId,
+        runIds: recentRuns.map((run) => run.id),
+      },
+    });
+  }
 
   async function getAgent(agentId: string) {
     return db
@@ -888,6 +1126,52 @@ export function heartbeatService(db: Db) {
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function resolveExecutionAttemptSummary(
+    agent: typeof agents.$inferSelect,
+    context: Record<string, unknown>,
+    now = new Date(),
+  ): Promise<ExecutionAttemptSummary> {
+    const workflowName = resolveWorkflowName(context);
+    const policyRow = await getAgentPolicyRow(agent.id, workflowName);
+    const policy = buildRoutedPolicy({
+      workflowName,
+      policyRow,
+      adapterConfig: parseObject(agent.adapterConfig),
+      agentAdapterType: agent.adapterType,
+    });
+    const usageDate = formatDateInTimezone(now, policy.timezone || DEFAULT_POLICY_TIMEZONE);
+    const primaryTokensUsedToday = await getPrimaryTokensUsedToday(agent.id, usageDate, policy.primaryProvider);
+    const route = selectExecutionRoute({
+      policy,
+      adapterConfig: parseObject(agent.adapterConfig),
+      primaryTokensUsedToday,
+      fallbackRequest: readFallbackRequest(context),
+    });
+    return {
+      route,
+      providerKey: deriveProviderUsageKey(route),
+      modelUsed: route.policyModel,
+      fallbackReason: route.fallbackReason,
+      usageDate,
+    };
+  }
+
+  async function queueRetryRun(input: {
+    agentId: string;
+    context: Record<string, unknown>;
+    triggerDetail: string;
+  }) {
+    const nextRun = await enqueueWakeup(input.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: input.triggerDetail,
+      requestedByActorType: "system",
+      requestedByActorId: "provider_fallback",
+      contextSnapshot: input.context,
+    }).catch(() => null);
+    return nextRun;
   }
 
   async function getTaskSession(
@@ -2050,8 +2334,15 @@ export function heartbeatService(db: Db) {
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
+    const executionAttempt = await resolveExecutionAttemptSummary(agent, context);
+    const executionAgent = {
+      ...agent,
+      adapterType: executionAttempt.route.adapterType,
+      adapterConfig: executionAttempt.route.adapterConfigPatch,
+    };
+    const adapterTypeChanged = executionAgent.adapterType !== agent.adapterType;
     const taskKey = deriveTaskKey(context, null);
-    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
+    const sessionCodec = getAdapterSessionCodec(executionAgent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     const issueContext = issueId
       ? await db
@@ -2095,24 +2386,28 @@ export function heartbeatService(db: Db) {
             ))
       : null;
     const taskSession = taskKey
-      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+      ? await getTaskSession(agent.companyId, agent.id, executionAgent.adapterType, taskKey)
       : null;
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
     const taskSessionForRun = resetTaskSession ? null : taskSession;
-    const explicitResumeSessionParams = normalizeSessionParams(
-      sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
-    );
-    const explicitResumeSessionDisplayId = truncateDisplayId(
-      readNonEmptyString(context.resumeSessionDisplayId) ??
-        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
-        readNonEmptyString(explicitResumeSessionParams?.sessionId),
-    );
+    const explicitResumeSessionParams = adapterTypeChanged
+      ? null
+      : normalizeSessionParams(
+          sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
+        );
+    const explicitResumeSessionDisplayId = adapterTypeChanged
+      ? null
+      : truncateDisplayId(
+          readNonEmptyString(context.resumeSessionDisplayId) ??
+            (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
+            readNonEmptyString(explicitResumeSessionParams?.sessionId),
+        );
     const previousSessionParams =
       explicitResumeSessionParams ??
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
-    const config = parseObject(agent.adapterConfig);
+    const config = parseObject(executionAgent.adapterConfig);
     const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -2351,7 +2646,7 @@ export function heartbeatService(db: Db) {
         .where(eq(heartbeatRuns.id, run.id));
     }
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
-      agentId: agent.id,
+      agentId: executionAgent.id,
       previousSessionParams,
       resolvedWorkspace: {
         ...resolvedWorkspace,
@@ -2363,6 +2658,11 @@ export function heartbeatService(db: Db) {
       ...resolvedWorkspace.warnings,
       ...executionWorkspace.warnings,
       ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),
+      ...(adapterTypeChanged
+        ? [
+            `Adapter switched from ${agent.adapterType} to ${executionAgent.adapterType}; ignoring persisted session state from the previous adapter.`,
+          ]
+        : []),
       ...(resetTaskSession && sessionResetReason
         ? [
             taskKey
@@ -2405,7 +2705,7 @@ export function heartbeatService(db: Db) {
     if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = executionWorkspace.projectId;
     }
-    const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
+    const runtimeSessionFallback = adapterTypeChanged || taskKey || resetTaskSession ? null : runtime.sessionId;
     let previousSessionDisplayId = truncateDisplayId(
       explicitResumeSessionDisplayId ??
         taskSessionForRun?.sessionDisplayId ??
@@ -2418,7 +2718,7 @@ export function heartbeatService(db: Db) {
     let runtimeSessionParamsForAdapter = runtimeSessionParams;
 
     const sessionCompaction = await evaluateSessionCompaction({
-      agent,
+      agent: executionAgent,
       sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
       issueId,
     });
@@ -2609,24 +2909,24 @@ export function heartbeatService(db: Db) {
         });
       };
 
-      const adapter = getServerAdapter(agent.adapterType);
+      const adapter = getServerAdapter(executionAgent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
-        ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
+        ? createLocalAgentJwt(executionAgent.id, executionAgent.companyId, executionAgent.adapterType, run.id)
         : null;
       if (adapter.supportsLocalAgentJwt && !authToken) {
         logger.warn(
           {
-            companyId: agent.companyId,
-            agentId: agent.id,
+            companyId: executionAgent.companyId,
+            agentId: executionAgent.id,
             runId: run.id,
-            adapterType: agent.adapterType,
+            adapterType: executionAgent.adapterType,
           },
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
       const adapterResult = await adapter.execute({
         runId: run.id,
-        agent,
+        agent: executionAgent,
         runtime: runtimeForAdapter,
         config: runtimeConfig,
         context,
@@ -2640,12 +2940,12 @@ export function heartbeatService(db: Db) {
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
-            adapterType: agent.adapterType,
+            adapterType: executionAgent.adapterType,
             runId: run.id,
             agent: {
-              id: agent.id,
-              name: agent.name,
-              companyId: agent.companyId,
+              id: executionAgent.id,
+              name: executionAgent.name,
+              companyId: executionAgent.companyId,
             },
             issue: issueRef,
             workspace: executionWorkspace,
@@ -2675,7 +2975,7 @@ export function heartbeatService(db: Db) {
                 workspace: executionWorkspace,
                 runtimeServices: adapterManagedRuntimeServices,
               }),
-              { agentId: agent.id },
+              { agentId: executionAgent.id },
             );
           } catch (err) {
             await onLog(
@@ -2694,7 +2994,7 @@ export function heartbeatService(db: Db) {
       });
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
-        agentId: agent.id,
+        agentId: executionAgent.id,
         runId: run.id,
         sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         rawUsage,
@@ -2726,9 +3026,17 @@ export function heartbeatService(db: Db) {
             : outcome === "timed_out"
               ? "timed_out"
               : "failed";
+      const tokensUsed = totalTokensForUsage(normalizedUsage ?? rawUsage);
+      const failureSignal =
+        outcome === "failed" || outcome === "timed_out"
+          ? classifyAdapterFailure({
+              result: adapterResult,
+              transportTimeoutRetryCount: resolveTransportTimeoutRetryCount(context),
+            })
+          : null;
 
       const usageJson =
-        normalizedUsage || adapterResult.costUsd != null
+        normalizedUsage || adapterResult.costUsd != null || executionAttempt.modelUsed || executionAttempt.fallbackReason
           ? ({
               ...(normalizedUsage ?? {}),
               ...(rawUsage ? {
@@ -2748,6 +3056,9 @@ export function heartbeatService(db: Db) {
               provider: readNonEmptyString(adapterResult.provider) ?? "unknown",
               biller: resolveLedgerBiller(adapterResult),
               model: readNonEmptyString(adapterResult.model) ?? "unknown",
+              model_used: executionAttempt.modelUsed,
+              tokens_used: tokensUsed,
+              fallback_reason: executionAttempt.fallbackReason,
               ...(adapterResult.costUsd != null ? { costUsd: adapterResult.costUsd } : {}),
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
@@ -2803,20 +3114,37 @@ export function heartbeatService(db: Db) {
       }
 
       if (finalizedRun) {
-        await updateRuntimeState(agent, finalizedRun, adapterResult, {
+        await updateRuntimeState(executionAgent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
+        if (outcome === "succeeded") {
+          await recordDailyTokenUsage({
+            agentId: executionAgent.id,
+            provider: executionAttempt.providerKey,
+            usageDate: executionAttempt.usageDate,
+            heartbeatRunId: finalizedRun.id,
+            usage: normalizedUsage ?? rawUsage,
+          });
+        } else if (failureSignal) {
+          await recordRunFailureFingerprint({
+            agentId: executionAgent.id,
+            workflowName: executionAttempt.route.workflowName,
+            signal: failureSignal,
+            targetRef: readNonEmptyString(context.issueId) ?? readNonEmptyString(context.projectId),
+          });
+          await alertIfConsecutiveFailures(executionAgent.id);
+        }
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
+            await clearTaskSessions(executionAgent.companyId, executionAgent.id, {
               taskKey,
-              adapterType: agent.adapterType,
+              adapterType: executionAgent.adapterType,
             });
           } else {
             await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
+              companyId: executionAgent.companyId,
+              agentId: executionAgent.id,
+              adapterType: executionAgent.adapterType,
               taskKey,
               sessionParamsJson: nextSessionState.params,
               sessionDisplayId: nextSessionState.displayId,
@@ -2825,8 +3153,28 @@ export function heartbeatService(db: Db) {
             });
           }
         }
+        if (failureSignal?.shouldQueuePrimaryRetry) {
+          await queueRetryRun({
+            agentId: executionAgent.id,
+            context: buildPrimaryRetryContext(
+              clearRetryRoutingContext(context),
+              resolveTransportTimeoutRetryCount(context) + 1,
+            ),
+            triggerDetail: "primary_transport_retry",
+          });
+        } else if (failureSignal?.shouldQueueFallbackRetry && failureSignal.fallbackReason) {
+          await queueRetryRun({
+            agentId: executionAgent.id,
+            context: buildFallbackRequest(clearRetryRoutingContext(context), {
+              reason: failureSignal.fallbackReason,
+              sourceRunId: finalizedRun.id,
+              retryCount: resolveTransportTimeoutRetryCount(context),
+            }),
+            triggerDetail: `fallback:${failureSignal.fallbackReason}`,
+          });
+        }
       }
-      await finalizeAgentStatus(agent.id, outcome);
+      await finalizeAgentStatus(executionAgent.id, outcome);
     } catch (err) {
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
@@ -2859,6 +3207,16 @@ export function heartbeatService(db: Db) {
       });
 
       if (failedRun) {
+        const failureSignal = classifyAdapterFailure({
+          result: {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: message,
+            errorCode: "adapter_failed",
+          },
+          transportTimeoutRetryCount: resolveTransportTimeoutRetryCount(context),
+        });
         await appendRunEvent(failedRun, seq++, {
           eventType: "error",
           stream: "system",
@@ -2867,7 +3225,7 @@ export function heartbeatService(db: Db) {
         });
         await releaseIssueExecutionAndPromote(failedRun);
 
-        await updateRuntimeState(agent, failedRun, {
+        await updateRuntimeState(executionAgent, failedRun, {
           exitCode: null,
           signal: null,
           timedOut: false,
@@ -2878,9 +3236,9 @@ export function heartbeatService(db: Db) {
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
           await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
+            companyId: executionAgent.companyId,
+            agentId: executionAgent.id,
+            adapterType: executionAgent.adapterType,
             taskKey,
             sessionParamsJson: previousSessionParams,
             sessionDisplayId: previousSessionDisplayId,
@@ -2888,9 +3246,16 @@ export function heartbeatService(db: Db) {
             lastError: message,
           });
         }
+        await recordRunFailureFingerprint({
+          agentId: executionAgent.id,
+          workflowName: executionAttempt.route.workflowName,
+          signal: failureSignal,
+          targetRef: readNonEmptyString(context.issueId) ?? readNonEmptyString(context.projectId),
+        });
+        await alertIfConsecutiveFailures(executionAgent.id);
       }
 
-      await finalizeAgentStatus(agent.id, "failed");
+      await finalizeAgentStatus(executionAgent.id, "failed");
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -3776,6 +4141,81 @@ export function heartbeatService(db: Db) {
     await cancelPendingWakeupsForBudgetScope(scope);
   }
 
+  async function monitorHealth(now = new Date()) {
+    const previousTickAt = monitorState.lastSchedulerTickAt;
+    if (previousTickAt && now.getTime() - previousTickAt > MONITOR_STALE_MS) {
+      await sendOperationalAlert({
+        key: "paperclip_deadman_switch",
+        severity: "critical",
+        title: "Paperclip heartbeat står stille",
+        message: `Heartbeat-scheduler hadde et gap på ${Math.round((now.getTime() - previousTickAt) / 1000)} sekunder før neste tick.`,
+        dedupeWindowMs: MONITOR_STALE_MS,
+        details: {
+          previousTickAt: new Date(previousTickAt).toISOString(),
+          observedAt: now.toISOString(),
+        },
+      });
+    }
+    monitorState.lastSchedulerTickAt = now.getTime();
+
+    const candidateAgents = await db
+      .select({
+        id: agents.id,
+        name: agents.name,
+      })
+      .from(agents)
+      .where(inArray(agents.status, ["active", "idle", "running", "error"]));
+    for (const agent of candidateAgents) {
+      await alertIfConsecutiveFailures(agent.id);
+    }
+
+    const dryRunPath = readNonEmptyString(process.env.PAPERCLIP_DRY_RUN_LOG_PATH);
+    if (!dryRunPath) return;
+
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+    const activeRunCount = Number(count ?? 0);
+    if (activeRunCount <= 0) return;
+
+    const stat = await fs.stat(dryRunPath).catch(() => null);
+    if (!stat) {
+      await sendOperationalAlert({
+        key: "dry_run_log_missing",
+        severity: "critical",
+        title: "Paperclip dry_run_log mangler",
+        message: `PAPERCLIP_DRY_RUN_LOG_PATH peker til "${dryRunPath}", men filen finnes ikke mens ${activeRunCount} run(s) er aktive.`,
+        dedupeWindowMs: MONITOR_STALE_MS,
+      });
+      return;
+    }
+
+    const signature = `${stat.size}:${stat.mtimeMs}`;
+    if (monitorState.lastDryRunSignature !== signature) {
+      monitorState.lastDryRunSignature = signature;
+      monitorState.lastDryRunGrowthAt = now.getTime();
+      return;
+    }
+
+    const lastGrowthAt = monitorState.lastDryRunGrowthAt ?? stat.mtimeMs;
+    monitorState.lastDryRunGrowthAt = lastGrowthAt;
+    if (now.getTime() - lastGrowthAt > MONITOR_STALE_MS) {
+      await sendOperationalAlert({
+        key: "dry_run_log_stalled",
+        severity: "critical",
+        title: "Paperclip dry_run_log står stille",
+        message: `dry_run_log har ikke vokst på over 5 minutter mens ${activeRunCount} run(s) er aktive.`,
+        dedupeWindowMs: MONITOR_STALE_MS,
+        details: {
+          dryRunLogPath: dryRunPath,
+          activeRunCount,
+          lastObservedGrowthAt: new Date(lastGrowthAt).toISOString(),
+        },
+      });
+    }
+  }
+
   return {
     list: async (companyId: string, agentId?: string, limit?: number) => {
       const query = db
@@ -3955,6 +4395,8 @@ export function heartbeatService(db: Db) {
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 
     cancelBudgetScopeWork,
+
+    monitorHealth,
 
     getActiveRunForAgent: async (agentId: string) => {
       const [run] = await db

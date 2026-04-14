@@ -571,6 +571,7 @@ export async function startServer(): Promise<StartedServer> {
     void heartbeat
       .reapOrphanedRuns()
       .then(() => heartbeat.resumeQueuedRuns())
+      .then(() => heartbeat.monitorHealth(new Date()))
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -604,6 +605,12 @@ export async function startServer(): Promise<StartedServer> {
         .then(() => heartbeat.resumeQueuedRuns())
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
+        });
+
+      void heartbeat
+        .monitorHealth(new Date())
+        .catch((err) => {
+          logger.error({ err }, "heartbeat operational monitor failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
   }
