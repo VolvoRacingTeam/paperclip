@@ -3,6 +3,9 @@ import { asString, asNumber, parseObject, parseJson } from "@paperclipai/adapter
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
+const CLAUDE_HTTP_429_RE = /\bhttp\s*429\b|\b429\b/i;
+const CLAUDE_RATE_LIMIT_RE = /\brate[ _-]?limit(?:[ _-]?error)?\b/i;
+const CLAUDE_OVERLOADED_RE = /\boverloaded(?:[ _-]?error)?\b/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -176,4 +179,35 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   return allMessages.some((msg) =>
     /no conversation found with session id|unknown session|session .* not found/i.test(msg),
   );
+}
+
+export function detectClaudeProviderFailure(input: {
+  parsed: Record<string, unknown> | null;
+  stdout: string;
+  stderr: string;
+}): { errorCode: string | null; httpStatus: number | null; providerErrorCode: string | null } {
+  const combined = [
+    asString(input.parsed?.result, ""),
+    ...extractClaudeErrorMessages(input.parsed ?? {}),
+    input.stdout,
+    input.stderr,
+  ]
+    .join("\n")
+    .trim();
+
+  if (!combined) {
+    return { errorCode: null, httpStatus: null, providerErrorCode: null };
+  }
+
+  if (CLAUDE_HTTP_429_RE.test(combined)) {
+    return { errorCode: "claude_http_429", httpStatus: 429, providerErrorCode: null };
+  }
+  if (CLAUDE_RATE_LIMIT_RE.test(combined)) {
+    return { errorCode: "anthropic_rate_limit_error", httpStatus: null, providerErrorCode: "rate_limit_error" };
+  }
+  if (CLAUDE_OVERLOADED_RE.test(combined)) {
+    return { errorCode: "anthropic_overloaded_error", httpStatus: null, providerErrorCode: "overloaded_error" };
+  }
+
+  return { errorCode: null, httpStatus: null, providerErrorCode: null };
 }

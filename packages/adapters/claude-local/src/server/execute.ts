@@ -25,6 +25,7 @@ import {
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
+  detectClaudeProviderFailure,
   detectClaudeLoginRequired,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
@@ -493,6 +494,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdout: proc.stdout,
       stderr: proc.stderr,
     });
+    const providerFailure = detectClaudeProviderFailure({
+      parsed,
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+    });
     const errorMeta =
       loginMeta.loginUrl != null
         ? {
@@ -518,8 +524,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: proc.signal,
         timedOut: false,
         errorMessage: parseFallbackErrorMessage(proc),
-        errorCode: loginMeta.requiresLogin ? "claude_auth_required" : null,
-        errorMeta,
+        errorCode: loginMeta.requiresLogin ? "claude_auth_required" : providerFailure.errorCode,
+        errorMeta: {
+          ...(errorMeta ?? {}),
+          ...(providerFailure.httpStatus != null ? { httpStatus: providerFailure.httpStatus } : {}),
+          ...(providerFailure.providerErrorCode ? { providerErrorCode: providerFailure.providerErrorCode } : {}),
+        },
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
@@ -561,8 +571,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (proc.exitCode ?? 0) === 0
           ? null
           : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`,
-      errorCode: loginMeta.requiresLogin ? "claude_auth_required" : null,
-      errorMeta,
+      errorCode: loginMeta.requiresLogin ? "claude_auth_required" : providerFailure.errorCode,
+      errorMeta: {
+        ...(errorMeta ?? {}),
+        ...(providerFailure.httpStatus != null ? { httpStatus: providerFailure.httpStatus } : {}),
+        ...(providerFailure.providerErrorCode ? { providerErrorCode: providerFailure.providerErrorCode } : {}),
+      },
       usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
