@@ -25,6 +25,15 @@ function defaultFikenToken(): string {
   return token;
 }
 
+function dryRunEnabled(): boolean {
+  return (process.env.PAPERCLIP_DRY_RUN ?? "true").trim().toLowerCase() === "true";
+}
+
+function shouldSendDryRunHeader(method?: string): boolean {
+  const normalized = (method ?? "GET").toUpperCase();
+  return dryRunEnabled() && normalized !== "GET" && normalized !== "HEAD" && normalized !== "OPTIONS";
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helper
 // ---------------------------------------------------------------------------
@@ -46,6 +55,9 @@ async function fikenFetch(
         Authorization: `Bearer ${bearer}`,
         "Content-Type": "application/json",
         ...(options?.headers as Record<string, string> ?? {}),
+        ...(shouldSendDryRunHeader(options?.method)
+          ? { "X-Paperclip-Dry-Run": "true" }
+          : {}),
       },
     });
     if (!res.ok) {
@@ -429,6 +441,9 @@ export async function executeFikenTool(
           headers: {
             Authorization: `Bearer ${apiKey}`,
             "Content-Type": "application/json",
+            ...(shouldSendDryRunHeader("POST")
+              ? { "X-Paperclip-Dry-Run": "true" }
+              : {}),
           },
           body: JSON.stringify(body),
         });
