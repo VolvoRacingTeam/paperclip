@@ -392,26 +392,29 @@ export async function executeFikenTool(
       const orgId = process.env.KUNDEOVERSIKT_ORG_ID;
       if (!apiKey || !orgId) return { error: "Missing AGENT_API_KEY or KUNDEOVERSIKT_ORG_ID" };
 
-      const body = {
+      const fikenPayload: Record<string, unknown> = {
+        date: args.date,
+        kind: "cash_purchase",
+        lines: [{
+          accountCode: args.accountCode,
+          amount: Math.round((args.amount as number) * 100), // NOK ??? ??re
+          vatType: args.vatType,
+          description: args.description,
+        }],
+      };
+      if (args.inboxDocumentId !== undefined && args.inboxDocumentId !== null) {
+        fikenPayload.inboxDocumentId = args.inboxDocumentId;
+      }
+
+      const body: Record<string, unknown> = {
         organizationId: orgId,
         companySlug: args.companySlug,
         customerId: args.customerId ?? undefined,
         bookingType: args.bookingType ?? "purchase",
-        fikenPayload: {
-          date: args.date,
-          kind: "cash_purchase",
-          lines: [{
-            accountCode: args.accountCode,
-            amount: Math.round((args.amount as number) * 100), // NOK â†’ Ã¸re
-            vatType: args.vatType,
-            description: args.description,
-          }],
-          inboxDocumentId: args.inboxDocumentId ?? null,
-        },
-        inboxDocumentId: args.inboxDocumentId ?? null,
+        fikenPayload,
         transactionDesc: args.transactionDesc ?? "",
         suggestedAccount: args.accountCode as string,
-        amountNok: typeof args.amount === 'number' ? args.amount : 0,
+        amountNok: typeof args.amount === "number" ? args.amount : 0,
         aiConfidence: typeof args.aiConfidence === "number" ? args.aiConfidence : 0.5,
         aiReasoning: (args.aiReasoning as string) ?? "",
         actorName: "paperclip-regnskapsforer",
