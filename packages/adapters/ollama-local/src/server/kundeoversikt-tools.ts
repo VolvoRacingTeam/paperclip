@@ -35,6 +35,15 @@ function apiKey(): string {
   return env("AGENT_API_KEY");
 }
 
+function dryRunEnabled(): boolean {
+  return (process.env.PAPERCLIP_DRY_RUN ?? "true").trim().toLowerCase() === "true";
+}
+
+function shouldSendDryRunHeader(method?: string): boolean {
+  const normalized = (method ?? "GET").toUpperCase();
+  return dryRunEnabled() && normalized !== "GET" && normalized !== "HEAD" && normalized !== "OPTIONS";
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helper
 // ---------------------------------------------------------------------------
@@ -51,6 +60,9 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
         Authorization: `Bearer ${apiKey()}`,
         "Content-Type": "application/json",
         ...(options?.headers as Record<string, string> ?? {}),
+        ...(shouldSendDryRunHeader(options?.method)
+          ? { "X-Paperclip-Dry-Run": "true" }
+          : {}),
       },
     });
     const body = await res.json() as Record<string, unknown>;
