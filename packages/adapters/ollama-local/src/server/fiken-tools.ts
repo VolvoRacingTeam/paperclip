@@ -10,6 +10,9 @@
  *   AGENT_API_KEY   â€” For fetching per-company tokens from Kundeoversikt
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
+
 import type { ToolDefinition } from "./schema.js";
 
 // ---------------------------------------------------------------------------
@@ -34,6 +37,24 @@ function shouldSendDryRunHeader(method?: string): boolean {
   return dryRunEnabled() && normalized !== "GET" && normalized !== "HEAD" && normalized !== "OPTIONS";
 }
 
+async function appendDryRunLog(entry: Record<string, unknown>): Promise<void> {
+  const filePath = process.env.PAPERCLIP_DRY_RUN_LOG_PATH?.trim();
+  if (!filePath) return;
+
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.appendFile(
+      filePath,
+      `${JSON.stringify({ loggedAt: new Date().toISOString(), ...entry })}\n`,
+      "utf8",
+    );
+  } catch (err) {
+    console.warn(
+      `[paperclip] could not append dry-run log: ${(err as Error).message}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helper
 // ---------------------------------------------------------------------------
@@ -45,6 +66,9 @@ async function fikenFetch(
 ): Promise<unknown> {
   const url = `${FIKEN_BASE}${path}`;
   const bearer = token ?? defaultFikenToken();
+  const method = (options?.method ?? "GET").toUpperCase();
+  const dryRun = shouldSendDryRunHeader(method);
+  const dryRunLog = dryRunEnabled();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
   try {
@@ -55,17 +79,34 @@ async function fikenFetch(
         Authorization: `Bearer ${bearer}`,
         "Content-Type": "application/json",
         ...(options?.headers as Record<string, string> ?? {}),
-        ...(shouldSendDryRunHeader(options?.method)
-          ? { "X-Paperclip-Dry-Run": "true" }
-          : {}),
+        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
       },
     });
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "fiken",
+        method,
+        path,
+        status: res.status,
+        ok: res.ok,
+        dryRunHeader: dryRun,
+      });
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       return { error: `Fiken API ${res.status}: ${text.slice(0, 300)}` };
     }
     return res.json();
   } catch (err) {
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "fiken",
+        method,
+        path,
+        error: (err as Error).message,
+        dryRunHeader: dryRun,
+      });
+    }
     return { error: `Fiken fetch failed: ${(err as Error).message}` };
   } finally {
     clearTimeout(timer);

@@ -10,6 +10,9 @@
  *   KUNDEOVERSIKT_ORG_ID     — Organization UUID for Verkvelven AS
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
+
 import type { ToolDefinition } from "./schema.js";
 
 // ---------------------------------------------------------------------------
@@ -44,12 +47,33 @@ function shouldSendDryRunHeader(method?: string): boolean {
   return dryRunEnabled() && normalized !== "GET" && normalized !== "HEAD" && normalized !== "OPTIONS";
 }
 
+async function appendDryRunLog(entry: Record<string, unknown>): Promise<void> {
+  const filePath = process.env.PAPERCLIP_DRY_RUN_LOG_PATH?.trim();
+  if (!filePath) return;
+
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.appendFile(
+      filePath,
+      `${JSON.stringify({ loggedAt: new Date().toISOString(), ...entry })}\n`,
+      "utf8",
+    );
+  } catch (err) {
+    console.warn(
+      `[paperclip] could not append dry-run log: ${(err as Error).message}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helper
 // ---------------------------------------------------------------------------
 
 async function agentFetch(path: string, options?: RequestInit): Promise<unknown> {
   const url = `${baseUrl()}${path}`;
+  const method = (options?.method ?? "GET").toUpperCase();
+  const dryRun = shouldSendDryRunHeader(method);
+  const dryRunLog = dryRunEnabled();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
   try {
@@ -60,17 +84,34 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
         Authorization: `Bearer ${apiKey()}`,
         "Content-Type": "application/json",
         ...(options?.headers as Record<string, string> ?? {}),
-        ...(shouldSendDryRunHeader(options?.method)
-          ? { "X-Paperclip-Dry-Run": "true" }
-          : {}),
+        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
       },
     });
     const body = await res.json() as Record<string, unknown>;
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "kundeoversikt",
+        method,
+        path,
+        status: res.status,
+        ok: res.ok,
+        dryRunHeader: dryRun,
+      });
+    }
     if (!res.ok) {
       return { error: `HTTP ${res.status}: ${JSON.stringify(body)}` };
     }
     return body;
   } catch (err) {
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "kundeoversikt",
+        method,
+        path,
+        error: (err as Error).message,
+        dryRunHeader: dryRun,
+      });
+    }
     return { error: `Fetch failed: ${(err as Error).message}` };
   } finally {
     clearTimeout(timer);
