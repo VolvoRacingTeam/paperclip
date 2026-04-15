@@ -166,7 +166,7 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "kundeoversikt_log_action",
     description:
-      "Logg en handling i Kundeoversikt (POST /api/agent/actions/log). " +
+      "Logg en handling i Kundeoversikt (POST /api/agent/actions). " +
       "Brukes for sporbarhet og audit-trail. " +
       "Logg ALLE handlinger: klassifisering, prospect-opprettelse, routing, draft-opprettelse. " +
       "Bruk emailLogId og customerId fra listen over ubehandlede e-poster.",
@@ -177,11 +177,11 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
         actionSummary: { type: "string", description: "Menneskelig lesbar beskrivelse av handlingen (1-2 setninger)." },
         emailLogId: { type: "string", description: "UUID for e-posten som handlingen gjelder. Hentes fra emailLogId i list_unprocessed_emails." },
         customerId: { type: "string", description: "UUID for kunden. Hentes fra customerId i list_unprocessed_emails." },
-        resultSummary: { type: "string", description: "Kort oppsummering av resultatet av handlingen." },
+        resultStatus: { type: "string", description: "Status: completed, failed, eller skipped." },
         actionDetails: { type: "object", description: "Valgfri: ekstra strukturert data om handlingen (nøkkel-verdi)." },
         prospectId: { type: "string", description: "Valgfri: UUID for prospect (kun ved prospect-relaterte handlinger)." },
       },
-      required: ["actionType", "actionSummary", "emailLogId", "customerId", "resultSummary"],
+      required: ["actionType", "actionSummary", "emailLogId", "customerId", "resultStatus"],
       additionalProperties: false,
     },
   },
@@ -265,7 +265,7 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
     parametersSchema: {
       type: "object",
       properties: {
-        conversationId: { type: "string", description: "graph_conversation_id fra e-posten." },
+        graphConversationId: { type: "string", description: "graph_conversation_id fra e-posten." },
         customerId: { type: "string", description: "UUID for kunden (valgfri)." },
         summaryText: { type: "string", description: "Kort oppsummering av tråden." },
         status: { type: "string", description: "Presis status, f.eks. 'Venter på svar fra Daniel Herigstad (Nextify Media)'." },
@@ -273,7 +273,34 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
         messageCount: { type: "integer", description: "Totalt antall meldinger i tråden.", minimum: 1 },
         lastMessageId: { type: "string", description: "ID for siste melding." },
       },
-      required: ["conversationId", "summaryText", "status", "keyPoints", "messageCount", "lastMessageId"],
+      required: ["graphConversationId", "summaryText", "status", "keyPoints", "messageCount", "lastMessageId"],
+      additionalProperties: false,
+    },
+  },
+  // === 11. Submit morning summary ===
+  {
+    name: "kundeoversikt_submit_morning_summary",
+    description:
+      "Send morgenresymé til Kundeoversikt. Kalles av scheduler kl 07:00. " +
+      "Oppsummerer siste 24 timers e-postbehandling, ventende utkast, og viktige hendelser.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        contentMarkdown: { type: "string", description: "Markdown-formatert resymé." },
+        highlightsJson: {
+          type: "object",
+          description: "Strukturert data for morgenresymé-widget.",
+          properties: {
+            mailsProcessed24h: { type: "integer", description: "Antall e-poster prosessert siste 24 timer." },
+            draftsWaiting: { type: "integer", description: "Antall utkast som venter på godkjenning." },
+            unprocessedNow: { type: "integer", description: "Antall ubehandlede e-poster akkurat nå." },
+            deadlines7d: { type: "array", items: { type: "string" }, description: "Frister neste 7 dager (tom liste hvis ingen)." },
+            warnings: { type: "array", items: { type: "string" }, description: "Advarsler (tom liste hvis ingen)." },
+          },
+          required: ["mailsProcessed24h", "draftsWaiting", "unprocessedNow", "deadlines7d", "warnings"],
+        },
+      },
+      required: ["contentMarkdown", "highlightsJson"],
       additionalProperties: false,
     },
   },
@@ -282,6 +309,16 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ---------------------------------------------------------------------------
 // Tool executor
 // ---------------------------------------------------------------------------
+
+function noteLegacyAlias(
+  toolName: string,
+  legacyField: string,
+  canonicalField: string,
+): string {
+  const msg = `[LEGACY ALIAS] ${toolName}: felt "${legacyField}" normaliseres til "${canonicalField}". Bruk "${canonicalField}" neste gang for å unngå dette.`;
+  console.log(msg);
+  return msg;
+}
 
 export async function executeKundeoversiktTool(
   toolName: string,
@@ -318,32 +355,165 @@ export async function executeKundeoversiktTool(
     }
 
     case "kundeoversikt_create_draft_reply": {
+      let bodyHtml =
+        typeof args.bodyHtml === "string" ? args.bodyHtml : undefined;
+
+      if (!bodyHtml && typeof args.content === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_create_draft_reply",
+          "content",
+          "bodyHtml",
+        );
+        bodyHtml = args.content;
+      }
+      if (!bodyHtml && typeof args.body === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_create_draft_reply",
+          "body",
+          "bodyHtml",
+        );
+        bodyHtml = args.body;
+      }
+      if (!bodyHtml && typeof args.html === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_create_draft_reply",
+          "html",
+          "bodyHtml",
+        );
+        bodyHtml = args.html;
+      }
+
+      // Auto-wrap rent tekst-innhold i <p>-tagger så backend er fornøyd
+      if (bodyHtml && !bodyHtml.includes("<")) {
+        bodyHtml = bodyHtml
+          .split(/\n{2,}/)
+          .map((p) => `<p>${p.replace(/\n/g, "<br>")}</p>`)
+          .join("");
+      }
+
+      // Godta "to" som string eller array — normaliser til array
+      let toArray: string[] | undefined;
+      if (Array.isArray(args.to)) {
+        toArray = args.to.filter((x): x is string => typeof x === "string");
+      } else if (typeof args.to === "string") {
+        toArray = [args.to];
+      }
+
+      // replyToEmailLogId default til emailLogId hvis den finnes
+      const replyToEmailLogId =
+        typeof args.replyToEmailLogId === "string"
+          ? args.replyToEmailLogId
+          : typeof args.emailLogId === "string"
+          ? args.emailLogId
+          : undefined;
+
+      const aiReasoning =
+        typeof args.aiReasoning === "string" && args.aiReasoning.trim().length >= 20
+          ? args.aiReasoning
+          : undefined;
+      const aiConfidence =
+        typeof args.aiConfidence === "number" &&
+        args.aiConfidence >= 0 &&
+        args.aiConfidence <= 1
+          ? args.aiConfidence
+          : undefined;
+
+      if (
+        !toArray ||
+        toArray.length === 0 ||
+        !args.subject ||
+        !bodyHtml ||
+        !replyToEmailLogId ||
+        !aiReasoning ||
+        aiConfidence === undefined
+      ) {
+        return {
+          error:
+            'kundeoversikt_create_draft_reply krever ALLE disse feltene: ' +
+            '"to" (array), "subject" (string), "bodyHtml" (HTML-tekst), ' +
+            '"replyToEmailLogId" (samme UUID som emailLogId fra originalen), ' +
+            '"aiReasoning" (minst 20 tegn — forklar Tore HVORFOR du foreslår dette svaret), ' +
+            '"aiConfidence" (tall mellom 0 og 1). ' +
+            'Bruk ikke "content" eller "body" — bruk "bodyHtml".',
+        };
+      }
+
       return agentFetch("/drafts", {
         method: "POST",
         body: JSON.stringify({
           organizationId: orgId(),
           agentName: "paperclip-email-assistant",
-          to: args.to,
+          to: toArray,
           cc: [],
           subject: args.subject,
-          bodyHtml: args.bodyHtml,
-          customerId: args.customerId ?? null,
-          replyToEmailLogId: args.replyToEmailLogId ?? null,
-          aiReasoning: args.aiReasoning ?? "",
-          aiConfidence: typeof args.aiConfidence === "number" ? args.aiConfidence : 0.5,
+          bodyHtml,
+          customerId:
+            typeof args.customerId === "string" && args.customerId.trim().length > 0
+              ? args.customerId
+              : null,
+          replyToEmailLogId,
+          aiReasoning,
+          aiConfidence,
         }),
       });
     }
 
     case "kundeoversikt_classify_email": {
-      const emailLogId = args.emailLogId as string;
+      const validContentCategories = [
+        "prospect",
+        "bilag",
+        "sporsmal",
+        "system",
+        "annet",
+      ] as const;
+
+      const emailLogId =
+        typeof args.emailLogId === "string" ? args.emailLogId : undefined;
       if (!emailLogId) return { error: "emailLogId er påkrevd" };
+
+      let contentCategory =
+        typeof args.contentCategory === "string"
+          ? args.contentCategory
+          : undefined;
+
+      if (!contentCategory && typeof args.classification === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_classify_email",
+          "classification",
+          "contentCategory",
+        );
+        contentCategory = args.classification;
+      }
+
+      if (!contentCategory && typeof args.category === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_classify_email",
+          "category",
+          "contentCategory",
+        );
+        contentCategory = args.category;
+      }
+
+      if (
+        !contentCategory ||
+        !validContentCategories.includes(
+          contentCategory as (typeof validContentCategories)[number],
+        )
+      ) {
+        return {
+          error:
+            `contentCategory mangler eller er ugyldig. ` +
+            `Gyldige verdier: ${validContentCategories.join(", ")}. ` +
+            `Bruk feltet "contentCategory" (ikke "classification" eller "category").`,
+        };
+      }
+
       return agentFetch(`/emails/${emailLogId}/classify`, {
         method: "PATCH",
         body: JSON.stringify({
           organizationId: orgId(),
           actorName: "paperclip-email-assistant",
-          contentCategory: args.contentCategory,
+          contentCategory,
           confidence: args.confidence,
           summary: args.summary,
           recommendedAction: args.recommendedAction,
@@ -352,16 +522,55 @@ export async function executeKundeoversiktTool(
     }
 
     case "kundeoversikt_log_action": {
-      return agentFetch("/actions/log", {
+      let actionType =
+        typeof args.actionType === "string" ? args.actionType : undefined;
+
+      if (!actionType && typeof args.action === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_log_action",
+          "action",
+          "actionType",
+        );
+        actionType = args.action;
+      }
+
+      let actionSummary =
+        typeof args.actionSummary === "string"
+          ? args.actionSummary
+          : undefined;
+
+      if (!actionSummary && typeof args.details === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_log_action",
+          "details",
+          "actionSummary",
+        );
+        actionSummary = args.details;
+      }
+
+      if (!actionType || !actionSummary) {
+        return {
+          error:
+            'kundeoversikt_log_action krever "actionType" og "actionSummary". ' +
+            'Bruk ikke "action" eller "details".',
+        };
+      }
+
+      const customerId =
+        typeof args.customerId === "string" && args.customerId.trim().length > 0
+          ? args.customerId
+          : undefined;
+
+      return agentFetch("/actions", {
         method: "POST",
         body: JSON.stringify({
           organizationId: orgId(),
           actorName: "paperclip-email-assistant",
-          actionType: args.actionType,
-          actionSummary: args.actionSummary,
+          actionType,
+          actionSummary,
           emailLogId: args.emailLogId,
-          customerId: args.customerId,
-          resultSummary: args.resultSummary,
+          customerId,
+          resultStatus: args.resultStatus ?? "completed",
           actionDetails: args.actionDetails ?? undefined,
           prospectId: args.prospectId ?? undefined,
         }),
@@ -409,19 +618,147 @@ export async function executeKundeoversiktTool(
     }
 
     case "kundeoversikt_upsert_email_summary": {
-      const conversationId = args.conversationId as string;
-      if (!conversationId) return { error: "conversationId er påkrevd" };
+      let graphConversationId =
+        typeof args.graphConversationId === "string"
+          ? args.graphConversationId
+          : undefined;
+
+      if (!graphConversationId && typeof args.conversationId === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_upsert_email_summary",
+          "conversationId",
+          "graphConversationId",
+        );
+        graphConversationId = args.conversationId;
+      }
+
+      if (!graphConversationId) {
+        return {
+          error:
+            'graphConversationId er påkrevd. Bruk feltet "graphConversationId" (ikke "conversationId").',
+        };
+      }
+
+      let summaryText =
+        typeof args.summaryText === "string" ? args.summaryText : undefined;
+
+      if (!summaryText && typeof args.summary === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_upsert_email_summary",
+          "summary",
+          "summaryText",
+        );
+        summaryText = args.summary;
+      }
+
+      let lastMessageId =
+        typeof args.lastMessageId === "string"
+          ? args.lastMessageId
+          : undefined;
+
+      if (!lastMessageId && typeof args.lastEmailId === "string") {
+        noteLegacyAlias(
+          "kundeoversikt_upsert_email_summary",
+          "lastEmailId",
+          "lastMessageId",
+        );
+        lastMessageId = args.lastEmailId;
+      }
+
+      if (!summaryText) {
+        return {
+          error:
+            'kundeoversikt_upsert_email_summary krever "summaryText" (kort oppsummering av e-posttråden, minst 10 tegn).',
+        };
+      }
+
+      const status =
+        typeof args.status === "string" && args.status.trim().length > 0
+          ? args.status
+          : "active";
+      const keyPoints = Array.isArray(args.keyPoints)
+        ? args.keyPoints.filter((x): x is string => typeof x === "string")
+        : [];
+      const messageCount =
+        typeof args.messageCount === "number" && args.messageCount > 0
+          ? args.messageCount
+          : 1;
+
       return agentFetch("/email-summaries", {
         method: "POST",
         body: JSON.stringify({
           organizationId: orgId(),
-          conversationId: args.conversationId,
-          customerId: args.customerId ?? null,
-          summaryText: args.summaryText,
-          status: args.status,
-          keyPoints: args.keyPoints,
-          messageCount: args.messageCount,
-          lastMessageId: args.lastMessageId,
+          graphConversationId,
+          customerId:
+            typeof args.customerId === "string" && args.customerId.trim().length > 0
+              ? args.customerId
+              : null,
+          summaryText,
+          status,
+          keyPoints,
+          messageCount,
+          lastMessageId: lastMessageId ?? null,
+        }),
+      });
+    }
+
+
+    case "kundeoversikt_submit_morning_summary": {
+      const contentMarkdown =
+        typeof args.contentMarkdown === "string" ? args.contentMarkdown : undefined;
+      if (!contentMarkdown) {
+        return {
+          error:
+            'kundeoversikt_submit_morning_summary krever "contentMarkdown" (Markdown-formatert resymé).',
+        };
+      }
+
+      const rawHighlights = args.highlightsJson as Record<string, unknown> | undefined;
+      if (!rawHighlights || typeof rawHighlights !== "object" || Array.isArray(rawHighlights)) {
+        return {
+          error:
+            'kundeoversikt_submit_morning_summary krever "highlightsJson" (objekt med mailsProcessed24h, draftsWaiting, unprocessedNow, deadlines7d, warnings).',
+        };
+      }
+
+      // Normalize common LLM field-name mistakes
+      const fieldAliases: Record<string, string> = {
+        unprocessed_emails: "unprocessedNow",
+        unprocessed: "unprocessedNow",
+        pending_drafts: "draftsWaiting",
+        pendingDrafts: "draftsWaiting",
+        new_prospects: "warnings",
+        mails_processed: "mailsProcessed24h",
+        mailsProcessed: "mailsProcessed24h",
+        processed24h: "mailsProcessed24h",
+        drafts_waiting: "draftsWaiting",
+        deadlines: "deadlines7d",
+      };
+      const highlightsJson: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rawHighlights)) {
+        const canonical = fieldAliases[k] ?? k;
+        if (canonical !== k) {
+          noteLegacyAlias("kundeoversikt_submit_morning_summary", k, canonical);
+        }
+        highlightsJson[canonical] = v;
+      }
+      // Ensure required fields exist with defaults
+      highlightsJson.mailsProcessed24h ??= 0;
+      highlightsJson.draftsWaiting ??= 0;
+      highlightsJson.unprocessedNow ??= 0;
+      highlightsJson.deadlines7d ??= [];
+      highlightsJson.warnings ??= [];
+
+      const runId = crypto.randomUUID();
+
+      return agentFetch("/morning-summary", {
+        method: "POST",
+        body: JSON.stringify({
+          organizationId: orgId(),
+          runId,
+          contentMarkdown,
+          highlightsJson,
+          generatedAtUtc: new Date().toISOString(),
         }),
       });
     }
