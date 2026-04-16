@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 
+// Advarsel: In-memory cache — idempotency-nøkler overlever ikke prosessrestart.
+// For produksjon bør dette persisteres til DB.
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_CACHE_SIZE = 10_000;
 
 type IdempotencyEntry = {
   idempotencyKey: string;
@@ -30,7 +33,7 @@ function stableStringify(value: unknown): string {
 
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, entryValue]) => entryValue !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right, "nb-NO"));
+    .sort(([left], [right]) => left.localeCompare(right));
 
   return `{${entries
     .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`)
@@ -60,6 +63,19 @@ export function pruneExpiredKeys(nowMs = Date.now()): number {
   return removed;
 }
 
+export function pruneOldestKeys(maxSize = MAX_CACHE_SIZE): number {
+  let removed = 0;
+
+  while (idempotencyCache.size > maxSize) {
+    const oldestKey = idempotencyCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    idempotencyCache.delete(oldestKey);
+    removed += 1;
+  }
+
+  return removed;
+}
+
 export function getOrCreateIdempotencyKey(queueId: string, payload: unknown): string {
   const nowMs = Date.now();
   pruneExpiredKeys(nowMs);
@@ -75,5 +91,6 @@ export function getOrCreateIdempotencyKey(queueId: string, payload: unknown): st
     idempotencyKey,
     expiresAtMs: nowMs + IDEMPOTENCY_TTL_MS,
   });
+  pruneOldestKeys();
   return idempotencyKey;
 }

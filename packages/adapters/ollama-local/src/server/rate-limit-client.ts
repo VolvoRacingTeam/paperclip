@@ -47,6 +47,11 @@ export function backoffFor429(res: Response, nowMs?: number): number {
     if (Number.isFinite(seconds) && seconds >= 0) {
       return seconds * 1000;
     }
+
+    const dateMs = Date.parse(retryAfter);
+    if (!Number.isNaN(dateMs)) {
+      return Math.max(0, dateMs - (nowMs ?? Date.now()));
+    }
   }
 
   const state = parseRateLimitHeaders(res.headers);

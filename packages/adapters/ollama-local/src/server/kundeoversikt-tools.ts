@@ -97,6 +97,10 @@ type RevisionSubmissionResponse = {
   idempotent_replay?: unknown;
 };
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LEARNING_DISABLED_SUPPRESS_MS = 5 * 60 * 1000;
+const learningDisabledSuppress = new Map<string, number>();
+
 // ---------------------------------------------------------------------------
 // Config from environment
 // ---------------------------------------------------------------------------
@@ -121,12 +125,12 @@ function apiKey(): string {
 }
 
 function dryRunEnabled(): boolean {
-  return (process.env.PAPERCLIP_DRY_RUN ?? "true").trim().toLowerCase() === "true";
+  return (process.env.PAPERCLIP_DRY_RUN ?? "false").trim().toLowerCase() === "true";
 }
 
 function shouldSendDryRunHeader(method?: string): boolean {
-  const normalized = (method ?? "GET").toUpperCase();
-  return dryRunEnabled() && normalized !== "GET" && normalized !== "HEAD" && normalized !== "OPTIONS";
+  void method;
+  return dryRunEnabled();
 }
 
 async function appendDryRunLog(entry: Record<string, unknown>): Promise<void> {
@@ -252,6 +256,20 @@ function invalidArguments(error: string): ToolError {
   return { error, code: "INVALID_ARGUMENTS" };
 }
 
+function isUuid(v: string): boolean {
+  return UUID_RE.test(v);
+}
+
+function requireUuid(value: string | undefined, field: string): ToolError | string {
+  if (!value) {
+    return invalidArguments(`${field} er påkrevd.`);
+  }
+  if (!isUuid(value)) {
+    return invalidArguments(`${field} må være en gyldig UUID`);
+  }
+  return value;
+}
+
 function normalizeErrorResponse(
   body: unknown,
   fallbackError: string,
@@ -286,6 +304,13 @@ function normalizeLimit(rawLimit: number | undefined, opts: {
   return Math.min(rounded, opts.maxValue);
 }
 
+function normalizeOffset(rawOffset: number | undefined, defaultValue = 0): number {
+  if (rawOffset === undefined) return defaultValue;
+  const rounded = Math.trunc(rawOffset);
+  if (rounded < 0) return defaultValue;
+  return rounded;
+}
+
 function ensureObjectPayload(
   value: unknown,
 ): JsonObject | null {
@@ -293,6 +318,12 @@ function ensureObjectPayload(
     return null;
   }
   return value;
+}
+
+function hasValidFikenPayloadShape(value: JsonObject): boolean {
+  const date = value.date;
+  const lines = value.lines;
+  return typeof date === "string" && date.trim().length > 0 && Array.isArray(lines) && lines.length > 0;
 }
 
 async function vent(ms: number): Promise<void> {
@@ -582,6 +613,8 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
 
   // === 10. List pending bookkeeping revisions ===
+  // LLM-skjemaet bruker camelCase for konsistens med øvrige tools,
+  // men HTTP-kontrakten mot serveren bruker snake_case i query/body.
   {
     name: "kundeoversikt_list_pending_revisions",
     description:
@@ -592,6 +625,7 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         organizationId: { type: "string", description: "Kundeoversikt organization_id." },
         companySlug: { type: "string", description: "Fiken company slug for saken." },
+        offset: { type: "integer", description: "Offset for paginering (standard 0).", minimum: 0, default: 0 },
         limit: { type: "integer", description: "Maks antall (standard 5, maks 20).", minimum: 1, maximum: 20 },
       },
       required: ["organizationId", "companySlug"],
@@ -610,6 +644,11 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         customerId: { type: "string", description: "Kunde-ID som feedback skal hentes for." },
         organizationId: { type: "string", description: "Kundeoversikt organization_id." },
+        expandToOrg: {
+          type: "boolean",
+          description: "Må være false. Endepunktet returnerer 400 for andre verdier.",
+          default: false,
+        },
         limit: { type: "integer", description: "Maks antall (standard 5, maks 20 på tool-nivå).", minimum: 1, maximum: 20 },
       },
       required: ["customerId", "organizationId"],
@@ -633,6 +672,11 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
         fikenPayload: { type: "object", description: "Revidert Fiken-payload." },
         aiReasoning: { type: "string", description: "Hvorfor revisjonen er riktig." },
         aiConfidence: { type: "number", description: "Konfidens mellom 0 og 1.", minimum: 0, maximum: 1 },
+        actorName: {
+          type: "string",
+          description: "Aktor-navn som sendes som actor_name i kontrakten.",
+          default: "paperclip-regnskapsforer",
+        },
         transactionDesc: { type: "string", description: "Valgfri transaksjonsbeskrivelse." },
         suggestedAccount: { type: "string", description: "Valgfri foreslått konto." },
       },
@@ -1007,9 +1051,12 @@ export async function executeKundeoversiktTool(
     }
 
     case "kundeoversikt_list_pending_revisions": {
-      const organizationId = readStringArg(args, "organizationId", "organization_id");
-      if (!organizationId) {
-        return invalidArguments("organizationId er påkrevd.");
+      const organizationId = requireUuid(
+        readStringArg(args, "organizationId", "organization_id"),
+        "organizationId",
+      );
+      if (typeof organizationId !== "string") {
+        return organizationId;
       }
 
       const companySlug = readStringArg(args, "companySlug", "company_slug");
@@ -1017,6 +1064,7 @@ export async function executeKundeoversiktTool(
         return invalidArguments("companySlug er påkrevd.");
       }
 
+      const offset = normalizeOffset(readNumberArg(args, "offset"), 0);
       const limit = normalizeLimit(readNumberArg(args, "limit"), {
         defaultValue: 5,
         maxValue: 20,
@@ -1026,6 +1074,7 @@ export async function executeKundeoversiktTool(
       params.set("status", "needs_revision");
       params.set("organization_id", organizationId);
       params.set("company_slug", companySlug);
+      params.set("offset", String(offset));
       params.set("limit", String(limit));
 
       const response = await agentBookkeepingFetch(`/bookkeeping/queue?${params.toString()}`);
@@ -1061,28 +1110,48 @@ export async function executeKundeoversiktTool(
         ? ((response.body as PendingRevisionListResponse).items as PendingRevision[])
         : [];
 
-      const filteredItems = items.filter((item) => {
-        if (item.status === "needs_human_escalation") {
+      const filteredItems = items.filter((item): item is PendingRevision => {
+        if (item == null || typeof item !== "object") {
+          return false;
+        }
+
+        const revisionItem = item as PendingRevision;
+        if (revisionItem.status === "needs_human_escalation") {
           console.warn(
-            `[kundeoversikt] ${toolName}: filtrerer ut sak ${item.id} med status needs_human_escalation.`,
+            `[kundeoversikt] ${toolName}: filtrerer ut sak ${revisionItem.id} med status needs_human_escalation.`,
           );
           return false;
         }
-        return item.status === "needs_revision";
+        return revisionItem.status === "needs_revision";
       });
 
       return filteredItems;
     }
 
     case "kundeoversikt_get_bookkeeping_feedback": {
-      const customerId = readStringArg(args, "customerId", "customer_id");
-      if (!customerId) {
-        return invalidArguments("customerId er påkrevd.");
+      const customerId = requireUuid(
+        readStringArg(args, "customerId", "customer_id"),
+        "customerId",
+      );
+      if (typeof customerId !== "string") {
+        return customerId;
       }
 
-      const organizationId = readStringArg(args, "organizationId", "organization_id");
-      if (!organizationId) {
-        return invalidArguments("organizationId er påkrevd.");
+      const organizationId = requireUuid(
+        readStringArg(args, "organizationId", "organization_id"),
+        "organizationId",
+      );
+      if (typeof organizationId !== "string") {
+        return organizationId;
+      }
+
+      if (args.expandToOrg !== undefined && args.expandToOrg !== false) {
+        return invalidArguments("expandToOrg må være false for dette endepunktet.");
+      }
+
+      const suppressUntilMs = learningDisabledSuppress.get(organizationId);
+      if (suppressUntilMs !== undefined && suppressUntilMs > Date.now()) {
+        return [];
       }
 
       // Kontrakten tillater maks 10, selv om MCP-laget gjerne kan foreslå høyere.
@@ -1092,8 +1161,10 @@ export async function executeKundeoversiktTool(
       });
 
       const params = new URLSearchParams();
-      params.set("customerId", customerId);
+      // Tool-skjemaet er camelCase, men HTTP-kontrakten krever snake_case.
+      params.set("customer_id", customerId);
       params.set("organization_id", organizationId);
+      params.set("expand_to_org", "false");
       params.set("limit", String(limit));
 
       const response = await agentBookkeepingFetch(`/bookkeeping/feedback-examples?${params.toString()}`);
@@ -1113,6 +1184,10 @@ export async function executeKundeoversiktTool(
           "Learning loop er deaktivert for denne organisasjonen",
         );
         if (normalized.code === "LEARNING_DISABLED") {
+          learningDisabledSuppress.set(
+            organizationId,
+            Date.now() + LEARNING_DISABLED_SUPPRESS_MS,
+          );
           console.info(
             `[kundeoversikt] learning_disabled_skipped customerId=${customerId} organizationId=${organizationId}`,
           );
@@ -1120,6 +1195,8 @@ export async function executeKundeoversiktTool(
         }
         return normalized;
       }
+
+      learningDisabledSuppress.delete(organizationId);
 
       if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 500) {
         return normalizeErrorResponse(
@@ -1147,14 +1224,20 @@ export async function executeKundeoversiktTool(
     }
 
     case "kundeoversikt_submit_bookkeeping_revision": {
-      const queueId = readStringArg(args, "queueId", "queue_id");
-      if (!queueId) {
-        return invalidArguments("queueId er påkrevd.");
+      const queueId = requireUuid(
+        readStringArg(args, "queueId", "queue_id"),
+        "queueId",
+      );
+      if (typeof queueId !== "string") {
+        return queueId;
       }
 
-      const organizationId = readStringArg(args, "organizationId", "organization_id");
-      if (!organizationId) {
-        return invalidArguments("organizationId er påkrevd.");
+      const organizationId = requireUuid(
+        readStringArg(args, "organizationId", "organization_id"),
+        "organizationId",
+      );
+      if (typeof organizationId !== "string") {
+        return organizationId;
       }
 
       const companySlug = readStringArg(args, "companySlug", "company_slug");
@@ -1165,6 +1248,9 @@ export async function executeKundeoversiktTool(
       const payloadOrError = ensureObjectPayload(args.fikenPayload ?? args.fiken_payload);
       if (!payloadOrError) {
         return invalidArguments("fikenPayload må være et objekt.");
+      }
+      if (!hasValidFikenPayloadShape(payloadOrError)) {
+        return invalidArguments("fikenPayload må inneholde date og lines med minst ett element.");
       }
 
       const aiReasoning = readStringArg(args, "aiReasoning", "ai_reasoning");
@@ -1180,16 +1266,27 @@ export async function executeKundeoversiktTool(
         return invalidArguments("aiConfidence må være mellom 0 og 1.");
       }
 
+      const actorName = readStringArg(args, "actorName", "actor_name") ?? "paperclip-regnskapsforer";
+      if (actorName.trim().length === 0) {
+        return invalidArguments("actorName kan ikke være tom.");
+      }
+
+      // Tool-skjemaet er camelCase, men request-body følger serverkontraktens snake_case.
       const body: JsonObject = {
         organization_id: organizationId,
         company_slug: companySlug,
         fiken_payload: payloadOrError,
         ai_reasoning: aiReasoning,
-        actor_name: "paperclip-regnskapsforer",
+        actor_name: actorName,
       };
 
       const customerId = readStringArg(args, "customerId", "customer_id");
-      if (customerId) body.customer_id = customerId;
+      if (customerId) {
+        if (!isUuid(customerId)) {
+          return invalidArguments("customerId må være en gyldig UUID");
+        }
+        body.customer_id = customerId;
+      }
 
       body.ai_confidence = aiConfidence;
 
