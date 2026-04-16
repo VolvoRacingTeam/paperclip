@@ -1,8 +1,9 @@
 /**
  * Built-in Kundeoversikt tools for the ollama_local adapter.
  *
- * 8 tools covering: email listing, customer context, draft replies,
- * email classification, action logging, and prospect management.
+ * 14 tools covering: email listing, customer context, draft replies,
+ * email classification, action logging, prospect management og
+ * bokføringsrevisjoner.
  *
  * Environment variables (set in /opt/paperclip/.env):
  *   AGENT_API_KEY            — Bearer token for Kundeoversikt agent API
@@ -13,7 +14,88 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { getOrCreateIdempotencyKey } from "./idempotency.js";
+import {
+  backoffFor429,
+  computeBackoffMs,
+  parseRateLimitHeaders,
+} from "./rate-limit-client.js";
 import type { ToolDefinition } from "./schema.js";
+
+type ToolError = {
+  error: string;
+  code?: string;
+  retry_after?: string;
+};
+
+type JsonObject = Record<string, unknown>;
+
+type PendingRevision = {
+  id: string;
+  organization_id: string;
+  customer_id: string | null;
+  document_id: string | null;
+  company_slug: string;
+  status: "needs_revision" | "needs_human_escalation";
+  booking_type: "purchase" | "journal_entry";
+  inbox_document_id: number | null;
+  fiken_payload: Record<string, unknown>;
+  transaction_desc: string | null;
+  suggested_account: string | null;
+  amount_nok: string;
+  ai_confidence: number;
+  ai_reasoning: string;
+  actor_name: string;
+  human_note: string | null;
+  human_note_structured: {
+    reason_codes: string[];
+    correct_account?: string | null;
+    correct_vat_code?: string | null;
+    document_interpretation?: string | null;
+    free_text?: string | null;
+  } | null;
+  revision_count: number;
+  last_feedback_at: string | null;
+  latest_feedback: {
+    feedback_id: string;
+    feedback_type: "edited" | "returned" | "rejected" | "positive_example";
+    human_note: string | null;
+    reason_codes: string[];
+    requested_at: string;
+    resolved_at: string | null;
+    resolved_by_actor_name: string | null;
+  } | null;
+  compliance_gate_open: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+type BookkeepingFeedbackExample = {
+  feedback_id: string;
+  queue_id: string;
+  document_id: string | null;
+  feedback_type: "edited" | "returned" | "rejected" | "positive_example";
+  original_proposal: Record<string, unknown>;
+  corrected_proposal: Record<string, unknown>;
+  human_note: string | null;
+  reason_codes: string[];
+  what_was_wrong?: string | null;
+  similarity: number;
+  created_at: string;
+};
+
+type PendingRevisionListResponse = {
+  items?: unknown;
+};
+
+type BookkeepingFeedbackResponse = {
+  examples?: unknown;
+};
+
+type RevisionSubmissionResponse = {
+  item?: unknown;
+  idempotent_replay?: unknown;
+};
 
 // ---------------------------------------------------------------------------
 // Config from environment
@@ -113,6 +195,208 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
       });
     }
     return { error: `Fetch failed: ${(err as Error).message}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+type KundeoversiktHttpResponse = {
+  status: number;
+  headers: Headers;
+  body: unknown;
+};
+
+function isRecord(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringArg(
+  args: Record<string, unknown>,
+  field: string,
+  alias?: string,
+): string | undefined {
+  const direct = args[field];
+  if (typeof direct === "string" && direct.trim().length > 0) {
+    return direct;
+  }
+
+  if (!alias) return undefined;
+  const legacy = args[alias];
+  if (typeof legacy === "string" && legacy.trim().length > 0) {
+    return legacy;
+  }
+
+  return undefined;
+}
+
+function readNumberArg(
+  args: Record<string, unknown>,
+  field: string,
+  alias?: string,
+): number | undefined {
+  const direct = args[field];
+  if (typeof direct === "number" && Number.isFinite(direct)) {
+    return direct;
+  }
+
+  if (!alias) return undefined;
+  const legacy = args[alias];
+  if (typeof legacy === "number" && Number.isFinite(legacy)) {
+    return legacy;
+  }
+
+  return undefined;
+}
+
+function invalidArguments(error: string): ToolError {
+  return { error, code: "INVALID_ARGUMENTS" };
+}
+
+function normalizeErrorResponse(
+  body: unknown,
+  fallbackError: string,
+  fallbackCode?: string,
+): ToolError {
+  if (isRecord(body) && typeof body.error === "string") {
+    const normalized: ToolError = {
+      error: body.error,
+    };
+    if (typeof body.code === "string") {
+      normalized.code = body.code;
+    } else if (fallbackCode) {
+      normalized.code = fallbackCode;
+    }
+    return normalized;
+  }
+
+  const normalized: ToolError = { error: fallbackError };
+  if (fallbackCode) {
+    normalized.code = fallbackCode;
+  }
+  return normalized;
+}
+
+function normalizeLimit(rawLimit: number | undefined, opts: {
+  defaultValue: number;
+  maxValue: number;
+}): number {
+  if (rawLimit === undefined) return opts.defaultValue;
+  const rounded = Math.trunc(rawLimit);
+  if (rounded < 1) return opts.defaultValue;
+  return Math.min(rounded, opts.maxValue);
+}
+
+function ensureObjectPayload(
+  value: unknown,
+): JsonObject | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return value;
+}
+
+async function vent(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function warnOnUnexpectedContractVersion(
+  toolName: string,
+  headers: Headers,
+): void {
+  const contractVersion = headers.get("X-Kundeoversikt-Contract-Version");
+  if (contractVersion !== "1") {
+    console.warn(
+      `[kundeoversikt] ${toolName}: uventet X-Kundeoversikt-Contract-Version=${contractVersion ?? "(mangler)"}`,
+    );
+  }
+}
+
+async function applyRateLimitBackoff(
+  toolName: string,
+  res: Response,
+  threshold = 4,
+): Promise<void> {
+  const waitMs =
+    res.status === 429
+      ? backoffFor429(res)
+      : computeBackoffMs(parseRateLimitHeaders(res.headers), { threshold });
+
+  if (waitMs <= 0) return;
+
+  console.warn(
+    `[kundeoversikt] ${toolName}: rate-limit backoff ${waitMs}ms før neste kall.`,
+  );
+  await vent(waitMs);
+}
+
+async function agentBookkeepingFetch(
+  requestPath: string,
+  options?: RequestInit,
+): Promise<KundeoversiktHttpResponse | ToolError> {
+  const url = `${baseUrl()}${requestPath}`;
+  const method = (options?.method ?? "GET").toUpperCase();
+  const dryRun = shouldSendDryRunHeader(method);
+  const dryRunLog = dryRunEnabled();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey()}`,
+        "Content-Type": "application/json",
+        "X-Paperclip-Contract-Version": "1",
+        ...(options?.headers as Record<string, string> ?? {}),
+        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
+      },
+    });
+
+    const rawText = await res.text();
+    let body: unknown = null;
+    if (rawText.trim().length > 0) {
+      try {
+        body = JSON.parse(rawText) as unknown;
+      } catch {
+        body = { error: rawText.slice(0, 500) };
+      }
+    }
+
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "kundeoversikt",
+        method,
+        path: requestPath,
+        status: res.status,
+        ok: res.ok,
+        dryRunHeader: dryRun,
+        contractVersion: "1",
+      });
+    }
+
+    return {
+      status: res.status,
+      headers: res.headers,
+      body,
+    };
+  } catch (err) {
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "kundeoversikt",
+        method,
+        path: requestPath,
+        error: (err as Error).message,
+        dryRunHeader: dryRun,
+        contractVersion: "1",
+      });
+    }
+
+    return {
+      error: `Fetch failed: ${(err as Error).message}`,
+      code: "FETCH_FAILED",
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -297,7 +581,67 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
-  // === 10. Upsert email summary ===
+  // === 10. List pending bookkeeping revisions ===
+  {
+    name: "kundeoversikt_list_pending_revisions",
+    description:
+      "List bokføringssaker i needs_revision for én organisasjon og ett selskap. " +
+      "Returnerer kun saker som fortsatt kan revideres maskinelt.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        organizationId: { type: "string", description: "Kundeoversikt organization_id." },
+        companySlug: { type: "string", description: "Fiken company slug for saken." },
+        limit: { type: "integer", description: "Maks antall (standard 5, maks 20).", minimum: 1, maximum: 20 },
+      },
+      required: ["organizationId", "companySlug"],
+      additionalProperties: false,
+    },
+  },
+
+  // === 11. Get bookkeeping feedback ===
+  {
+    name: "kundeoversikt_get_bookkeeping_feedback",
+    description:
+      "Hent few-shot-eksempler for bokføring på kundenivå. " +
+      "Brukes før ny revisjon sendes inn.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        customerId: { type: "string", description: "Kunde-ID som feedback skal hentes for." },
+        organizationId: { type: "string", description: "Kundeoversikt organization_id." },
+        limit: { type: "integer", description: "Maks antall (standard 5, maks 20 på tool-nivå).", minimum: 1, maximum: 20 },
+      },
+      required: ["customerId", "organizationId"],
+      additionalProperties: false,
+    },
+  },
+
+  // === 12. Submit bookkeeping revision ===
+  {
+    name: "kundeoversikt_submit_bookkeeping_revision",
+    description:
+      "Send et revidert bokføringsforslag tilbake på et needs_revision-køelement. " +
+      "Kontrakten krever company_slug i body, derfor eksponeres companySlug eksplisitt her.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        queueId: { type: "string", description: "bookkeeping_queue.id som skal revideres." },
+        organizationId: { type: "string", description: "Kundeoversikt organization_id." },
+        companySlug: { type: "string", description: "Fiken company slug som må matche organizationId." },
+        customerId: { type: "string", description: "Valgfri customer_id hvis agenten kjenner den." },
+        fikenPayload: { type: "object", description: "Revidert Fiken-payload." },
+        aiReasoning: { type: "string", description: "Hvorfor revisjonen er riktig." },
+        aiConfidence: { type: "number", description: "Konfidens mellom 0 og 1.", minimum: 0, maximum: 1 },
+        transactionDesc: { type: "string", description: "Valgfri transaksjonsbeskrivelse." },
+        suggestedAccount: { type: "string", description: "Valgfri foreslått konto." },
+      },
+      required: ["queueId", "organizationId", "companySlug", "fikenPayload", "aiReasoning", "aiConfidence"],
+      additionalProperties: false,
+    },
+  },
+
+  // === 13. Upsert email summary ===
   {
     name: "kundeoversikt_upsert_email_summary",
     description:
@@ -318,7 +662,7 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
-  // === 11. Submit morning summary ===
+  // === 14. Submit morning summary ===
   {
     name: "kundeoversikt_submit_morning_summary",
     description:
@@ -346,6 +690,10 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 ];
+
+const KUNDEOVERSIKT_TOOL_NAMES = new Set(
+  KUNDEOVERSIKT_TOOL_DEFINITIONS.map((tool) => tool.name),
+);
 
 // ---------------------------------------------------------------------------
 // Tool executor
@@ -658,6 +1006,270 @@ export async function executeKundeoversiktTool(
       return agentFetch(`/draft-feedback?${params.toString()}`);
     }
 
+    case "kundeoversikt_list_pending_revisions": {
+      const organizationId = readStringArg(args, "organizationId", "organization_id");
+      if (!organizationId) {
+        return invalidArguments("organizationId er påkrevd.");
+      }
+
+      const companySlug = readStringArg(args, "companySlug", "company_slug");
+      if (!companySlug) {
+        return invalidArguments("companySlug er påkrevd.");
+      }
+
+      const limit = normalizeLimit(readNumberArg(args, "limit"), {
+        defaultValue: 5,
+        maxValue: 20,
+      });
+
+      const params = new URLSearchParams();
+      params.set("status", "needs_revision");
+      params.set("organization_id", organizationId);
+      params.set("company_slug", companySlug);
+      params.set("limit", String(limit));
+
+      const response = await agentBookkeepingFetch(`/bookkeeping/queue?${params.toString()}`);
+      if ("error" in response) return response;
+
+      warnOnUnexpectedContractVersion(toolName, response.headers);
+
+      const syntheticResponse = new Response(null, {
+        status: response.status,
+        headers: response.headers,
+      });
+      await applyRateLimitBackoff(toolName, syntheticResponse);
+
+      if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 500) {
+        return normalizeErrorResponse(
+          response.body,
+          `Kunne ikke hente bokføringskø (HTTP ${response.status})`,
+        );
+      }
+
+      if (response.status !== 200) {
+        return normalizeErrorResponse(
+          response.body,
+          `Uventet svar fra bokføringskø (HTTP ${response.status})`,
+        );
+      }
+
+      if (!isRecord(response.body)) {
+        return normalizeErrorResponse(null, "Kunne ikke tolke svar fra bokføringskø.", "INVALID_RESPONSE");
+      }
+
+      const items = Array.isArray((response.body as PendingRevisionListResponse).items)
+        ? ((response.body as PendingRevisionListResponse).items as PendingRevision[])
+        : [];
+
+      const filteredItems = items.filter((item) => {
+        if (item.status === "needs_human_escalation") {
+          console.warn(
+            `[kundeoversikt] ${toolName}: filtrerer ut sak ${item.id} med status needs_human_escalation.`,
+          );
+          return false;
+        }
+        return item.status === "needs_revision";
+      });
+
+      return filteredItems;
+    }
+
+    case "kundeoversikt_get_bookkeeping_feedback": {
+      const customerId = readStringArg(args, "customerId", "customer_id");
+      if (!customerId) {
+        return invalidArguments("customerId er påkrevd.");
+      }
+
+      const organizationId = readStringArg(args, "organizationId", "organization_id");
+      if (!organizationId) {
+        return invalidArguments("organizationId er påkrevd.");
+      }
+
+      // Kontrakten tillater maks 10, selv om MCP-laget gjerne kan foreslå høyere.
+      const limit = normalizeLimit(readNumberArg(args, "limit"), {
+        defaultValue: 5,
+        maxValue: 10,
+      });
+
+      const params = new URLSearchParams();
+      params.set("customerId", customerId);
+      params.set("organization_id", organizationId);
+      params.set("limit", String(limit));
+
+      const response = await agentBookkeepingFetch(`/bookkeeping/feedback-examples?${params.toString()}`);
+      if ("error" in response) return response;
+
+      warnOnUnexpectedContractVersion(toolName, response.headers);
+
+      const syntheticResponse = new Response(null, {
+        status: response.status,
+        headers: response.headers,
+      });
+      await applyRateLimitBackoff(toolName, syntheticResponse);
+
+      if (response.status === 409) {
+        const normalized = normalizeErrorResponse(
+          response.body,
+          "Learning loop er deaktivert for denne organisasjonen",
+        );
+        if (normalized.code === "LEARNING_DISABLED") {
+          console.info(
+            `[kundeoversikt] learning_disabled_skipped customerId=${customerId} organizationId=${organizationId}`,
+          );
+          return [];
+        }
+        return normalized;
+      }
+
+      if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 500) {
+        return normalizeErrorResponse(
+          response.body,
+          `Kunne ikke hente feedback-eksempler (HTTP ${response.status})`,
+        );
+      }
+
+      if (response.status !== 200) {
+        return normalizeErrorResponse(
+          response.body,
+          `Uventet svar fra feedback-eksempler (HTTP ${response.status})`,
+        );
+      }
+
+      if (!isRecord(response.body)) {
+        return normalizeErrorResponse(null, "Kunne ikke tolke svar fra feedback-eksempler.", "INVALID_RESPONSE");
+      }
+
+      const examples = Array.isArray((response.body as BookkeepingFeedbackResponse).examples)
+        ? ((response.body as BookkeepingFeedbackResponse).examples as BookkeepingFeedbackExample[])
+        : [];
+
+      return examples;
+    }
+
+    case "kundeoversikt_submit_bookkeeping_revision": {
+      const queueId = readStringArg(args, "queueId", "queue_id");
+      if (!queueId) {
+        return invalidArguments("queueId er påkrevd.");
+      }
+
+      const organizationId = readStringArg(args, "organizationId", "organization_id");
+      if (!organizationId) {
+        return invalidArguments("organizationId er påkrevd.");
+      }
+
+      const companySlug = readStringArg(args, "companySlug", "company_slug");
+      if (!companySlug) {
+        return invalidArguments("companySlug er påkrevd fordi kontrakten krever company_slug i request body.");
+      }
+
+      const payloadOrError = ensureObjectPayload(args.fikenPayload ?? args.fiken_payload);
+      if (!payloadOrError) {
+        return invalidArguments("fikenPayload må være et objekt.");
+      }
+
+      const aiReasoning = readStringArg(args, "aiReasoning", "ai_reasoning");
+      if (!aiReasoning) {
+        return invalidArguments("aiReasoning er påkrevd.");
+      }
+
+      const aiConfidence = readNumberArg(args, "aiConfidence", "ai_confidence");
+      if (aiConfidence === undefined) {
+        return invalidArguments("aiConfidence er påkrevd.");
+      }
+      if (aiConfidence !== undefined && (aiConfidence < 0 || aiConfidence > 1)) {
+        return invalidArguments("aiConfidence må være mellom 0 og 1.");
+      }
+
+      const body: JsonObject = {
+        organization_id: organizationId,
+        company_slug: companySlug,
+        fiken_payload: payloadOrError,
+        ai_reasoning: aiReasoning,
+        actor_name: "paperclip-regnskapsforer",
+      };
+
+      const customerId = readStringArg(args, "customerId", "customer_id");
+      if (customerId) body.customer_id = customerId;
+
+      body.ai_confidence = aiConfidence;
+
+      const transactionDesc = readStringArg(args, "transactionDesc", "transaction_desc");
+      if (transactionDesc) body.transaction_desc = transactionDesc;
+
+      const suggestedAccount = readStringArg(args, "suggestedAccount", "suggested_account");
+      if (suggestedAccount) body.suggested_account = suggestedAccount;
+
+      const idempotencyKey = getOrCreateIdempotencyKey(queueId, body);
+      const response = await agentBookkeepingFetch(
+        `/bookkeeping/queue/${encodeURIComponent(queueId)}/revision-result`,
+        {
+          method: "POST",
+          headers: {
+            "Idempotency-Key": idempotencyKey,
+          },
+          body: JSON.stringify(body),
+        },
+      );
+      if ("error" in response) return response;
+
+      warnOnUnexpectedContractVersion(toolName, response.headers);
+
+      const syntheticResponse = new Response(null, {
+        status: response.status,
+        headers: response.headers,
+      });
+      await applyRateLimitBackoff(toolName, syntheticResponse);
+
+      if (response.status === 409) {
+        const normalized = normalizeErrorResponse(
+          response.body,
+          "Saken kan ikke revideres akkurat nå.",
+        );
+        if (normalized.code === "COMPLIANCE_CASE_OPEN") {
+          return {
+            ...normalized,
+            retry_after: "Etter at compliance-saken er lukket.",
+          };
+        }
+        return normalized;
+      }
+
+      if (response.status === 422) {
+        return normalizeErrorResponse(
+          response.body,
+          "Saken er eskalert til menneskelig behandling.",
+        );
+      }
+
+      if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 500) {
+        return normalizeErrorResponse(
+          response.body,
+          `Kunne ikke lagre revidert bokføringsforslag (HTTP ${response.status})`,
+        );
+      }
+
+      if (response.status !== 200) {
+        return normalizeErrorResponse(
+          response.body,
+          `Uventet svar fra revision-result (HTTP ${response.status})`,
+        );
+      }
+
+      if (!isRecord(response.body)) {
+        return normalizeErrorResponse(null, "Kunne ikke tolke svar fra revision-result.", "INVALID_RESPONSE");
+      }
+
+      const resultBody = response.body as RevisionSubmissionResponse;
+      if (!isRecord(resultBody.item)) {
+        return normalizeErrorResponse(null, "Manglet item i revision-result.", "INVALID_RESPONSE");
+      }
+
+      return {
+        ...resultBody.item,
+        idempotent_replay: resultBody.idempotent_replay === true,
+      };
+    }
+
     case "kundeoversikt_upsert_email_summary": {
       let graphConversationId =
         typeof args.graphConversationId === "string"
@@ -810,5 +1422,5 @@ export async function executeKundeoversiktTool(
 }
 
 export function isKundeoversiktTool(name: string): boolean {
-  return name.startsWith("kundeoversikt_");
+  return KUNDEOVERSIKT_TOOL_NAMES.has(name);
 }

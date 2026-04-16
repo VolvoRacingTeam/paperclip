@@ -65,6 +65,17 @@ export {
   executeKundeoversiktTool,
   isKundeoversiktTool,
 } from "./kundeoversikt-tools.js";
+export {
+  parseRateLimitHeaders,
+  computeBackoffMs,
+  backoffFor429,
+  type RateLimitState,
+} from "./rate-limit-client.js";
+export {
+  generateIdempotencyKey,
+  getOrCreateIdempotencyKey,
+  pruneExpiredKeys,
+} from "./idempotency.js";
 
 // ---------------------------------------------------------------------------
 // Fiken built-in tools (bookkeeping automation)

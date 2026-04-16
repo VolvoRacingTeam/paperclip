@@ -1,0 +1,255 @@
+{
+  "listPendingRevisions_happy": {
+    "items": [
+      {
+        "id": "79c3bb61-58df-4f4f-a978-1b31c9f02a66",
+        "organization_id": "3f7f2f5c-83cf-4f2b-9a4f-7fbc2e7c91be",
+        "customer_id": "1f53b983-6d7d-40db-8e3b-4a08f0f32a0f",
+        "document_id": "0fe52fb7-2d96-4ff5-b411-4f4cfa4d5d8d",
+        "company_slug": "verkvelven-as",
+        "status": "needs_revision",
+        "booking_type": "purchase",
+        "inbox_document_id": 443221,
+        "fiken_payload": {
+          "date": "2026-04-14",
+          "kind": "cash_purchase",
+          "lines": [
+            {
+              "accountCode": "6800",
+              "amount": 29900,
+              "vatType": "HIGH",
+              "description": "Månedsfaktura leasing"
+            }
+          ]
+        },
+        "transaction_desc": "Leasing april 2026",
+        "suggested_account": "6800",
+        "amount_nok": "299.00",
+        "ai_confidence": 0.81,
+        "ai_reasoning": "Tolket fakturaen som kontorrekvisita basert på leverandørnavn.",
+        "actor_name": "paperclip-bookkeeping-agent",
+        "human_note": "Feil konto. Dette er leasing, ikke kontorrekvisita.",
+        "human_note_structured": {
+          "reason_codes": ["konto", "tolkning"],
+          "correct_account": "6300",
+          "correct_vat_code": "1",
+          "document_interpretation": "leasing",
+          "free_text": "Feil konto. Dette er leasing, ikke kontorrekvisita."
+        },
+        "revision_count": 1,
+        "last_feedback_at": "2026-04-16T08:15:22.000Z",
+        "latest_feedback": {
+          "feedback_id": "5fba6f2d-8ec8-4dfa-9d1d-880b8a364c0a",
+          "feedback_type": "returned",
+          "human_note": "Feil konto. Dette er leasing, ikke kontorrekvisita.",
+          "reason_codes": ["konto", "tolkning"],
+          "requested_at": "2026-04-16T08:15:22.000Z",
+          "resolved_at": null,
+          "resolved_by_actor_name": null
+        },
+        "compliance_gate_open": false,
+        "created_at": "2026-04-16T08:01:03.000Z",
+        "updated_at": "2026-04-16T08:15:22.000Z"
+      },
+      {
+        "id": "9ac8d808-1a0f-4c19-a375-d0fc7d87a228",
+        "organization_id": "3f7f2f5c-83cf-4f2b-9a4f-7fbc2e7c91be",
+        "customer_id": "1f53b983-6d7d-40db-8e3b-4a08f0f32a0f",
+        "document_id": "11111111-2222-3333-4444-555555555555",
+        "company_slug": "verkvelven-as",
+        "status": "needs_human_escalation",
+        "booking_type": "purchase",
+        "inbox_document_id": 443222,
+        "fiken_payload": {
+          "date": "2026-04-15",
+          "kind": "cash_purchase",
+          "lines": [
+            {
+              "accountCode": "6800",
+              "amount": 19900,
+              "vatType": "HIGH",
+              "description": "Uavklart bilag"
+            }
+          ]
+        },
+        "transaction_desc": "Uavklart april 2026",
+        "suggested_account": "6800",
+        "amount_nok": "199.00",
+        "ai_confidence": 0.32,
+        "ai_reasoning": "Lav sikkerhet og motstridende signaler i bilaget.",
+        "actor_name": "paperclip-bookkeeping-agent",
+        "human_note": "Må vurderes manuelt.",
+        "human_note_structured": {
+          "reason_codes": ["eskalering"],
+          "free_text": "Må vurderes manuelt."
+        },
+        "revision_count": 3,
+        "last_feedback_at": "2026-04-16T09:15:22.000Z",
+        "latest_feedback": {
+          "feedback_id": "22222222-3333-4444-5555-666666666666",
+          "feedback_type": "returned",
+          "human_note": "Må vurderes manuelt.",
+          "reason_codes": ["eskalering"],
+          "requested_at": "2026-04-16T09:15:22.000Z",
+          "resolved_at": null,
+          "resolved_by_actor_name": null
+        },
+        "compliance_gate_open": true,
+        "created_at": "2026-04-16T08:05:03.000Z",
+        "updated_at": "2026-04-16T09:15:22.000Z"
+      }
+    ],
+    "count": 2,
+    "limit": 5,
+    "offset": 0
+  },
+  "listPendingRevisions_empty": {
+    "items": [],
+    "count": 0,
+    "limit": 5,
+    "offset": 0
+  },
+  "getBookkeepingFeedback_happy": {
+    "examples": [
+      {
+        "feedback_id": "94b0f56a-1e7f-4581-b8e3-80f6cf77071b",
+        "queue_id": "79c3bb61-58df-4f4f-a978-1b31c9f02a66",
+        "document_id": "0fe52fb7-2d96-4ff5-b411-4f4cfa4d5d8d",
+        "feedback_type": "edited",
+        "original_proposal": {
+          "date": "2026-04-14",
+          "kind": "cash_purchase",
+          "lines": [
+            {
+              "accountCode": "6800",
+              "amount": 29900,
+              "vatType": "HIGH",
+              "description": "Månedsfaktura leasing"
+            }
+          ]
+        },
+        "corrected_proposal": {
+          "date": "2026-04-14",
+          "kind": "cash_purchase",
+          "lines": [
+            {
+              "accountCode": "6300",
+              "amount": 29900,
+              "vatType": "HIGH",
+              "description": "Månedsfaktura leasing"
+            }
+          ]
+        },
+        "human_note": "Bruk leasingkonto 6300 på denne leverandøren.",
+        "reason_codes": ["konto", "tolkning"],
+        "what_was_wrong": "Forslaget brukte 6800, men bilaget gjaldt leasing og skulle føres på 6300.",
+        "similarity": 0.94,
+        "created_at": "2026-04-16T07:40:10.000Z"
+      },
+      {
+        "feedback_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "queue_id": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+        "document_id": "12345678-1234-4234-8234-123456789012",
+        "feedback_type": "returned",
+        "original_proposal": {
+          "date": "2026-03-12",
+          "kind": "cash_purchase",
+          "lines": [
+            {
+              "accountCode": "6900",
+              "amount": 12900,
+              "vatType": "HIGH",
+              "description": "Mobilabonnement"
+            }
+          ]
+        },
+        "corrected_proposal": {
+          "date": "2026-03-12",
+          "kind": "cash_purchase",
+          "lines": [
+            {
+              "accountCode": "6990",
+              "amount": 12900,
+              "vatType": "HIGH",
+              "description": "Mobilabonnement"
+            }
+          ]
+        },
+        "human_note": "Bruk 6990 når abonnementet gjelder flere tjenester.",
+        "reason_codes": ["konto"],
+        "what_was_wrong": "Kontoen var for spesifikk.",
+        "similarity": 0.82,
+        "created_at": "2026-04-10T11:20:10.000Z"
+      },
+      {
+        "feedback_id": "12121212-3434-4567-8a8a-909090909090",
+        "queue_id": "67676767-8989-4a4a-8b8b-010101010101",
+        "document_id": null,
+        "feedback_type": "positive_example",
+        "original_proposal": {
+          "date": "2026-02-01",
+          "kind": "cash_purchase"
+        },
+        "corrected_proposal": {
+          "date": "2026-02-01",
+          "kind": "cash_purchase"
+        },
+        "human_note": "Bra forslag, samme mønster neste gang.",
+        "reason_codes": [],
+        "what_was_wrong": null,
+        "similarity": 0.61,
+        "created_at": "2026-04-01T09:00:00.000Z"
+      }
+    ],
+    "count": 3,
+    "limit": 5,
+    "next_cursor": null
+  },
+  "getBookkeepingFeedback_disabled": {
+    "error": "Learning loop er deaktivert for denne organisasjonen",
+    "code": "LEARNING_DISABLED"
+  },
+  "submitRevision_happy": {
+    "item": {
+      "id": "79c3bb61-58df-4f4f-a978-1b31c9f02a66",
+      "organization_id": "3f7f2f5c-83cf-4f2b-9a4f-7fbc2e7c91be",
+      "customer_id": "1f53b983-6d7d-40db-8e3b-4a08f0f32a0f",
+      "document_id": "0fe52fb7-2d96-4ff5-b411-4f4cfa4d5d8d",
+      "company_slug": "verkvelven-as",
+      "status": "pending",
+      "booking_type": "purchase",
+      "inbox_document_id": 443221,
+      "fiken_payload": {
+        "date": "2026-04-14",
+        "kind": "cash_purchase",
+        "lines": [
+          {
+            "accountCode": "6300",
+            "amount": 29900,
+            "vatType": "HIGH",
+            "description": "Månedsfaktura leasing"
+          }
+        ]
+      },
+      "transaction_desc": "Leasing april 2026",
+      "suggested_account": "6300",
+      "amount_nok": "299.00",
+      "ai_confidence": 0.93,
+      "ai_reasoning": "Brukte menneskelig note og tidligere læringseksempler. Bilaget gjelder leasing og skal til konto 6300.",
+      "actor_name": "paperclip-regnskapsforer",
+      "human_note": "Feil konto. Dette er leasing, ikke kontorrekvisita.",
+      "revision_count": 1,
+      "created_at": "2026-04-16T08:01:03.000Z",
+      "updated_at": "2026-04-16T08:21:11.000Z"
+    },
+    "idempotent_replay": false
+  },
+  "submitRevision_complianceBlocked": {
+    "error": "Saken kan ikke revideres mens en compliance-sak er åpen for samme bilag",
+    "code": "COMPLIANCE_CASE_OPEN"
+  },
+  "submitRevision_escalated": {
+    "error": "revision_count >= 3. Ny AI-revisjon er ikke tillatt",
+    "code": "REVISION_LIMIT_REACHED"
+  }
+}
