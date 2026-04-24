@@ -351,6 +351,13 @@
       "when": 1777180800000,
       "tag": "0049_son97_pending_retry",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1777180860000,
+      "tag": "0050_son97_severity_column",
+      "breakpoints": true
     }
   ]
 }

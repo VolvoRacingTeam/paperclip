@@ -33,6 +33,11 @@ export const workerLearningPatterns = pgTable(
     exampleCorrect: jsonb("example_correct").$type<Record<string, unknown>>(),
     exampleWrong: jsonb("example_wrong").$type<Record<string, unknown>>(),
     occurrenceCount: integer("occurrence_count").notNull().default(1),
+    // Fix 11: severity som egen kolonne (info|warning|critical) i stedet
+    // for prefix-marker i pattern_description. CHECK-constraint sikres i
+    // migration 0049. Default 'info' slik at gamle rader uten verdi blir
+    // gyldige uten manuelt vedlikehold.
+    severity: text("severity").notNull().default("info"),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

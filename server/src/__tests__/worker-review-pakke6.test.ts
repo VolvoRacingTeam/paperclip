@@ -177,7 +177,8 @@ describe("workerReviewService.upsertWorkerPattern", () => {
     const db = makeDb();
     const existing = {
       id: "p-1",
-      patternDescription: "[severity=info] Old desc",
+      patternDescription: "Old desc",
+      severity: "info",
       occurrenceCount: 1,
       exampleCorrect: null,
       exampleWrong: null,
@@ -196,14 +197,18 @@ describe("workerReviewService.upsertWorkerPattern", () => {
       severity: "critical",
     });
     const updateSet = db.__state.updatedPatterns[0];
-    expect(updateSet.patternDescription).toContain("[severity=critical]");
+    // Fix 11: severity er nu en egen kolonne. Vi sjekker at den oppdateres.
+    expect(updateSet.severity).toBe("critical");
+    // patternDescription skal ikke lenger ha [severity=..]-prefiks.
+    expect(updateSet.patternDescription).not.toMatch(/^\[severity=/u);
   });
 
   it("beholder strengeste severity ved update naar nytt input er svakere", async () => {
     const db = makeDb();
     const existing = {
       id: "p-1",
-      patternDescription: "[severity=critical] Old desc",
+      patternDescription: "Old desc",
+      severity: "critical",
       occurrenceCount: 1,
       exampleCorrect: null,
       exampleWrong: null,
@@ -222,7 +227,8 @@ describe("workerReviewService.upsertWorkerPattern", () => {
       severity: "info",
     });
     const updateSet = db.__state.updatedPatterns[0];
-    expect(updateSet.patternDescription).toContain("[severity=critical]");
+    // Fix 11: severity beholdes som critical naar nytt input er svakere.
+    expect(updateSet.severity).toBe("critical");
   });
 });
 

@@ -38,6 +38,16 @@ function extractSeverity(desc: string | null): Severity {
   return (m?.[1] as Severity | undefined) ?? "warning";
 }
 
+/**
+ * Fix 11: foretrukket lesemetode for severity. Bruker kolonnen direkte
+ * hvis den er satt; hvis ikke, fallback til prefix-marker.
+ */
+function severityFromRow(row: WorkerLearningPattern): Severity {
+  const col = (row as unknown as { severity?: string | null }).severity;
+  if (col === "info" || col === "warning" || col === "critical") return col;
+  return extractSeverity(row.patternDescription);
+}
+
 function stripSeverityMarker(desc: string): string {
   return desc.replace(/^\[severity=(info|warning|critical)\]\s*/u, "");
 }
@@ -106,7 +116,7 @@ export function workerLearningInjectionService(db: Db) {
         const r = row as unknown as Record<string, unknown>;
         if (r["archivedAt"] != null) continue;
       }
-      const sev = extractSeverity(row.patternDescription);
+      const sev = severityFromRow(row);
       const ttlMs = severityTtlDays(sev) * 24 * 60 * 60 * 1000;
       const lastSeen = row.lastSeenAt instanceof Date
         ? row.lastSeenAt
@@ -117,8 +127,8 @@ export function workerLearningInjectionService(db: Db) {
 
     // Final sort by (severity, occurrence, freshness)
     kept.sort((a, b) => {
-      const sevA = SEVERITY_RANK[extractSeverity(a.patternDescription)];
-      const sevB = SEVERITY_RANK[extractSeverity(b.patternDescription)];
+      const sevA = SEVERITY_RANK[severityFromRow(a)];
+      const sevB = SEVERITY_RANK[severityFromRow(b)];
       if (sevA !== sevB) return sevB - sevA;
       const occA = a.occurrenceCount ?? 1;
       const occB = b.occurrenceCount ?? 1;
@@ -187,7 +197,7 @@ export function workerLearningInjectionService(db: Db) {
     index: number,
     exampleCharCap: number,
   ): string {
-    const severity = extractSeverity(p.patternDescription);
+    const severity = severityFromRow(p);
     const desc = stripSeverityMarker(p.patternDescription);
     const lines: string[] = [];
     lines.push(`${index}. [${severity}] \`${p.patternTag}\``);

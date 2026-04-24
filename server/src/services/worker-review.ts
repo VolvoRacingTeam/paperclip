@@ -87,6 +87,18 @@ function extractSeverityFromDesc(
   return (m?.[1] as "info" | "warning" | "critical" | undefined) ?? "warning";
 }
 
+/**
+ * Fix 11: les severity fra kolonnen direkte; fall tilbake til prefix-marker
+ * for rader fra foer migration 0049 var paafoert.
+ */
+function readSeverityFromRow(
+  row: { severity?: string | null; patternDescription: string | null },
+): "info" | "warning" | "critical" {
+  const col = row.severity;
+  if (col === "info" || col === "warning" || col === "critical") return col;
+  return extractSeverityFromDesc(row.patternDescription);
+}
+
 function stripSeverityMarker(desc: string): string {
   return desc.replace(/^\[severity=(info|warning|critical)\]\s*/u, "");
 }
@@ -752,10 +764,11 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
           companyId: input.companyId,
           workerAgentId: input.workerAgentId,
           patternTag: input.patternTag,
-          patternDescription: formatDescriptionWithSeverity(
-            input.patternDescription,
-            input.severity,
-          ),
+          // Fix 11: severity bor nu i en egen kolonne. Vi stripper
+          // ev. legacy [severity=..]-prefiks slik at description blir
+          // ren tekst.
+          patternDescription: stripSeverityMarker(input.patternDescription),
+          severity: input.severity,
           exampleCorrect: exampleCorrectObj,
           exampleWrong: exampleWrongObj,
           occurrenceCount: 1,
@@ -778,20 +791,20 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
       return { pattern: inserted, createdOrUpdated: "created" };
     }
 
-    const prevSev = extractSeverityFromDesc(existing.patternDescription);
+    // Fix 11: les severity fra kolonnen direkte. Fallback til prefix-marker
+    // for legacy-rader hvor migration 0049 backfill ikke er gjort.
+    const existingSev = readSeverityFromRow(existing);
     const nextSev =
-      severityRank[input.severity] > severityRank[prevSev]
+      severityRank[input.severity] > severityRank[existingSev]
         ? input.severity
-        : prevSev;
-    const nextDescription = formatDescriptionWithSeverity(
-      input.patternDescription,
-      nextSev,
-    );
+        : existingSev;
+    const nextDescription = stripSeverityMarker(input.patternDescription);
 
     const updated = await db
       .update(workerLearningPatterns)
       .set({
         patternDescription: nextDescription,
+        severity: nextSev,
         exampleCorrect: exampleCorrectObj ?? existing.exampleCorrect,
         exampleWrong: exampleWrongObj ?? existing.exampleWrong,
         occurrenceCount: (existing.occurrenceCount ?? 1) + 1,
