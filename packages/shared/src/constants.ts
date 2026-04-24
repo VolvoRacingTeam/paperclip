@@ -200,6 +200,7 @@ export type ApprovalType = (typeof APPROVAL_TYPES)[number];
 
 export const APPROVAL_STATUSES = [
   "pending",
+  "pending_manager_review",
   "revision_requested",
   "approved",
   "rejected",
