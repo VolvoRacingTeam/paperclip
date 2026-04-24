@@ -28,7 +28,13 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
-import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup, routineService, workerLearningSynthesizer } from "./services/index.js";
+import {
+  heartbeatService,
+  reconcilePersistedRuntimeServicesOnStartup,
+  routineService,
+  workerLearningSynthesizer,
+  workerReviewMetricsService,
+} from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -641,8 +647,31 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "heartbeat operational monitor failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
+
+    // Pakke B: worker-review observability-cron (hver 10 min). Aggregerer
+    // worker_review_log siste 10 min per manager og logger metrics +
+    // kill-criteria-alerts til activity_log. Guard via env-var
+    // PAPERCLIP_MANAGER_REVIEW_METRICS_ENABLED (default true).
+    const workerReviewMetrics = workerReviewMetricsService(db as any);
+    if (workerReviewMetrics.isEnabled()) {
+      const metricsIntervalMs = 10 * 60 * 1000;
+      // Kjor en tick rett etter at scheduler-en er satt opp slik at vi ikke
+      // venter 10 min paa foerste data-punkt etter omstart.
+      void workerReviewMetrics
+        .tick(new Date())
+        .catch((err) => {
+          logger.error({ err }, "worker_review_metrics startup tick failed");
+        });
+      setInterval(() => {
+        void workerReviewMetrics
+          .tick(new Date())
+          .catch((err) => {
+            logger.error({ err }, "worker_review_metrics tick failed");
+          });
+      }, metricsIntervalMs);
+    }
   }
-  
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
     let backupInFlight = false;
