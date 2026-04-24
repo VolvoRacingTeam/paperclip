@@ -358,6 +358,13 @@
       "when": 1777180860000,
       "tag": "0050_son97_severity_column",
       "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1777180920000,
+      "tag": "0051_manager_sonnet_usage",
+      "breakpoints": true
     }
   ]
 }

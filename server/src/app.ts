@@ -20,6 +20,7 @@ import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
 import { approvalRoutes } from "./routes/approvals.js";
 import { workerReviewRoutes } from "./routes/worker-reviews.js";
+import { managerSonnetUsageRoutes } from "./routes/manager-sonnet-usage.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
@@ -157,6 +158,7 @@ export async function createApp(
   api.use(goalRoutes(db));
   api.use(approvalRoutes(db));
   api.use(workerReviewRoutes(db));
+  api.use(managerSonnetUsageRoutes(db));
   api.use(secretRoutes(db));
   api.use(costRoutes(db));
   api.use(activityRoutes(db));

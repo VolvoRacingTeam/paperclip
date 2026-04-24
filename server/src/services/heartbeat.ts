@@ -1,4 +1,9 @@
 import { workerLearningInjectionService } from "./worker-learning-injection.js";
+import {
+  managerSonnetUsageService,
+  isManagerWakeReason,
+  buildUsageRecordFromAdapterResult,
+} from "./manager-sonnet-usage.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
@@ -3020,6 +3025,8 @@ export function heartbeatService(db: Db) {
         logger.warn({ err, agentId: executionAgent.id }, "tier1 pattern injection failed");
       }
 
+      // Pakke D (SON-97): tidsmaaling for manager-sonnet-usage
+      const __managerSonnetStart = Date.now();
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent: executionAgent,
@@ -3033,6 +3040,30 @@ export function heartbeatService(db: Db) {
         },
         authToken: authToken ?? undefined,
       });
+      // Pakke D (SON-97): persister manager_sonnet_usage hvis claude_local
+      // og wakeReason indikerer manager-aktivitet. Best-effort, faaler ikke runen.
+      try {
+        const wakeReason = typeof context.wakeReason === "string" ? context.wakeReason : null;
+        if (executionAgent.adapterType === "claude_local" && isManagerWakeReason(wakeReason)) {
+          const usage = adapterResult.usage ?? null;
+          const record = buildUsageRecordFromAdapterResult({
+            companyId: executionAgent.companyId,
+            agentId: executionAgent.id,
+            runId: run.id,
+            wakeReason,
+            inputTokens: usage?.inputTokens ?? null,
+            outputTokens: usage?.outputTokens ?? null,
+            cachedInputTokens: usage?.cachedInputTokens ?? null,
+            durationMs: Date.now() - __managerSonnetStart,
+          });
+          await managerSonnetUsageService(db).record(record);
+        }
+      } catch (err) {
+        logger.warn(
+          { err, agentId: executionAgent.id, runId: run.id },
+          "manager_sonnet_usage record failed",
+        );
+      }
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,

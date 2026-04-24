@@ -47,3 +47,12 @@ export {
   type KillCriteriaAlert,
   type MetricsTickSummary,
 } from "./worker-review-metrics.js";
+export {
+  managerSonnetUsageService,
+  type ManagerSonnetUsageService,
+  type AgentAggregate as ManagerSonnetAgentAggregate,
+  isManagerWakeReason,
+  estimateTokensFromCharCount,
+  buildUsageRecordFromAdapterResult,
+  MANAGER_WAKE_REASONS,
+} from "./manager-sonnet-usage.js";

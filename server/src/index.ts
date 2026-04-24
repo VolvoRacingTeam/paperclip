@@ -34,6 +34,7 @@ import {
   routineService,
   workerLearningSynthesizer,
   workerReviewMetricsService,
+  managerSonnetUsageService,
 } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -647,6 +648,34 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "heartbeat operational monitor failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
+    // Pakke D (SON-97): hourly aggregator for manager-sonnet-usage.
+    // Aggregerer forrige time per company til activity_log
+    // (manager_sonnet.hourly_usage). Sender daily-alert hvis sum siste 24t
+    // overstiger PAPERCLIP_MANAGER_SONNET_DAILY_ALERT_TOKENS (default 500k).
+    {
+      const sonnetUsage = managerSonnetUsageService(db as any);
+      const sonnetIntervalMs = 60 * 60 * 1000;
+      let lastSonnetTickHour: number | null = null;
+      const tickIfNewHour = () => {
+        const now = new Date();
+        const currentHour = now.getUTCHours() + now.getUTCFullYear() * 1_000_000 + now.getUTCMonth() * 10_000 + now.getUTCDate() * 100;
+        if (lastSonnetTickHour === currentHour) return;
+        lastSonnetTickHour = currentHour;
+        void sonnetUsage
+          .hourlyAggregateAndLog(now)
+          .then((summary) => {
+            if (summary.companies > 0 || summary.alerts > 0) {
+              logger.info({ ...summary }, "manager_sonnet_usage hourly tick done");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "manager_sonnet_usage hourly tick failed");
+          });
+      };
+      tickIfNewHour();
+      setInterval(tickIfNewHour, sonnetIntervalMs);
+    }
+
 
     // Pakke B: worker-review observability-cron (hver 10 min). Aggregerer
     // worker_review_log siste 10 min per manager og logger metrics +

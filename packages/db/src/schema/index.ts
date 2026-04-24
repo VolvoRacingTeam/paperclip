@@ -69,3 +69,8 @@ export {
   type WorkerLearningPattern,
   type NewWorkerLearningPattern,
 } from "./worker_learning_patterns.js";
+export {
+  managerSonnetUsage,
+  type ManagerSonnetUsage,
+  type NewManagerSonnetUsage,
+} from "./manager_sonnet_usage.js";
