@@ -40,6 +40,7 @@ export const workerLearningPatterns = pgTable(
     injectedAt: timestamp("injected_at", { withTimezone: true }),
     ruleInAgentsMd: boolean("rule_in_agents_md").notNull().default(false),
     knowledgeBaseEntryId: uuid("knowledge_base_entry_id"),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

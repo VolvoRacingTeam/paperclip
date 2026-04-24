@@ -337,6 +337,13 @@
       "when": 1777036800000,
       "tag": "0047_manager_review_hook",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1777123200000,
+      "tag": "0048_worker_learning_archived_at",
+      "breakpoints": true
     }
   ]
 }
