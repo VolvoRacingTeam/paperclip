@@ -10,11 +10,13 @@ import {
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import {
+  agentService,
   approvalService,
   heartbeatService,
   issueApprovalService,
   logActivity,
   secretService,
+  workerReviewService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
@@ -32,7 +34,14 @@ export function approvalRoutes(db: Db) {
   const heartbeat = heartbeatService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  const agentsSvc = agentService(db);
+  const workerReviewSvc = workerReviewService(db, {
+    heartbeat: { wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts) },
+    approvals: svc,
+  });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+  const managerReviewEnabled =
+    process.env.PAPERCLIP_MANAGER_REVIEW_ENABLED !== "false";
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -72,6 +81,77 @@ export function approvalRoutes(db: Db) {
         : approvalInput.payload;
 
     const actor = getActorInfo(req);
+
+    // Manager-review intercept: hvis agent har requires_manager_review=true og
+    // reports_to peker paa en manager-agent, roter forslaget gjennom
+    // workerReviewService i stedet for aa skrive direkte til approvals.
+    // Merk: workerReviewService.promoteToApproval kaller approvalService.create()
+    // direkte paa service-laget (ikke via HTTP), saa det unngaar denne routen
+    // og trenger derfor ingen bypass-flag.
+    if (
+      managerReviewEnabled &&
+      actor.actorType === "agent" &&
+      actor.agentId
+    ) {
+      const agent = await agentsSvc.getById(actor.agentId);
+      const adapterCfg =
+        agent && typeof agent.adapterConfig === "object" && agent.adapterConfig !== null
+          ? (agent.adapterConfig as Record<string, unknown>)
+          : {};
+      const requiresManagerReview = adapterCfg.requires_manager_review === true;
+      if (agent && requiresManagerReview && agent.reportsTo) {
+        const review = await workerReviewSvc.submitForReview({
+          companyId,
+          workerAgentId: agent.id,
+          managerAgentId: agent.reportsTo,
+          taskType: approvalInput.type,
+          taskPayload:
+            typeof req.body?.rationale === "object" && req.body.rationale !== null
+              ? (req.body.rationale as Record<string, unknown>)
+              : (normalizedPayload as Record<string, unknown>),
+          proposedPayload: normalizedPayload as Record<string, unknown>,
+          rationale: typeof req.body?.rationale === "string" ? req.body.rationale : null,
+          sourceRunId: actor.runId ?? null,
+        });
+
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          action: "worker_review.intercepted",
+          entityType: "worker_review",
+          entityId: review.id,
+          details: {
+            type: approvalInput.type,
+            managerAgentId: agent.reportsTo,
+            issueIds: uniqueIssueIds,
+          },
+        });
+
+        // Fake approval-objekt for worker-SDK-kompatibilitet.
+        // Worker ser "pending_manager_review" som ikke-terminalt status;
+        // ingen side-effekter paa Tores approval-board (ingen approvals-rad ennaa).
+        res.status(201).json({
+          id: review.id,
+          companyId,
+          type: approvalInput.type,
+          status: "pending_manager_review",
+          requestedByAgentId: actor.agentId,
+          requestedByUserId: null,
+          payload: redactEventPayload(normalizedPayload) ?? {},
+          decisionNote: null,
+          decidedByUserId: null,
+          decidedAt: null,
+          createdAt: review.createdAt,
+          updatedAt: review.updatedAt,
+          __worker_review: true,
+          __pending_review_id: review.id,
+        });
+        return;
+      }
+    }
+
     const approval = await svc.create(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
