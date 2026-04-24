@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -899,6 +899,81 @@ function resolveNextSessionState(input: {
     displayId,
     legacySessionId,
   };
+}
+
+/**
+ * Pakke A (F5 retry-sweep): plukker opp worker_review_log-rader som ble
+ * etterlatt i status PENDING_RETRY fordi heartbeat.wakeup feilet inne i
+ * queueWorkerRetry. Eksportert separat slik at unit-test kan kjore mot en
+ * mocket db uten aa instansiere hele heartbeatService.
+ */
+export interface PendingRetrySweepDeps {
+  db: Db;
+  now: Date;
+  minuteBucket: number;
+  enqueueWakeup: (
+    agentId: string,
+    opts: Record<string, unknown>,
+  ) => Promise<unknown>;
+  log?: { warn: (...args: unknown[]) => void };
+}
+
+export async function sweepPendingRetryReviews(deps: PendingRetrySweepDeps): Promise<{
+  scanned: number;
+  enqueued: number;
+  failed: number;
+}> {
+  const log = deps.log ?? logger;
+  const stalePendingRetryMs = 5 * 60 * 1000;
+  const cutoff = new Date(deps.now.getTime() - stalePendingRetryMs);
+  const stalePending = await deps.db
+    .select({
+      id: workerReviewLog.id,
+      workerAgentId: workerReviewLog.workerAgentId,
+      managerAgentId: workerReviewLog.managerAgentId,
+      companyId: workerReviewLog.companyId,
+      taskType: workerReviewLog.taskType,
+      taskPayload: workerReviewLog.taskPayload,
+      attemptCount: workerReviewLog.attemptCount,
+    })
+    .from(workerReviewLog)
+    .where(
+      and(
+        eq(workerReviewLog.managerDecision, "PENDING_RETRY"),
+        lt(workerReviewLog.updatedAt, cutoff),
+      ),
+    )
+    .limit(50);
+
+  let enqueued = 0;
+  let failed = 0;
+  for (const row of stalePending) {
+    try {
+      await deps.enqueueWakeup(row.workerAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "pending_retry_sweep",
+        requestedByActorType: "system",
+        requestedByActorId: "worker_review_retry_sweep",
+        idempotencyKey: `retry-sweep:${row.id}:${deps.minuteBucket}`,
+        contextSnapshot: {
+          source: "worker_review_retry_sweep",
+          reason: "pending_retry_sweep",
+          reviewId: row.id,
+          workerAgentId: row.workerAgentId,
+          managerAgentId: row.managerAgentId,
+          attemptCount: row.attemptCount ?? 0,
+          originalTaskType: row.taskType,
+          originalTaskPayload: row.taskPayload,
+        },
+      });
+      enqueued += 1;
+    } catch (err) {
+      failed += 1;
+      log.warn({ err, reviewId: row.id }, "pending_retry_sweep failed");
+    }
+  }
+  return { scanned: stalePending.length, enqueued, failed };
 }
 
 export function heartbeatService(db: Db) {
@@ -4479,6 +4554,23 @@ export function heartbeatService(db: Db) {
         }
       } catch (err) {
         logger.warn({ err }, "worker_review sweep failed (non-fatal)");
+      }
+
+      // Pakke A (F5 retry-sweep): rader satt til PENDING_RETRY av
+      // queueWorkerRetry blir liggende uten oppfoelging hvis
+      // heartbeat.wakeup feilet inne i retry-pathen. Egen sweep plukker
+      // opp rader eldre enn 5 min og enqueuer wakeup paa nytt med en
+      // minutt-buckettet idempotency-key slik at vi ikke spammer dedupe.
+      try {
+        await sweepPendingRetryReviews({
+          db,
+          now,
+          minuteBucket,
+          enqueueWakeup: (agentId, opts) =>
+            enqueueWakeup(agentId, opts as WakeupOptions),
+        });
+      } catch (err) {
+        logger.warn({ err }, "worker_review pending-retry sweep failed (non-fatal)");
       }
 
       return { checked, enqueued, skipped };
