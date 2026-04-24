@@ -80,3 +80,21 @@ export const WORKER_REVIEW_LIMITS = {
   catchUpSweepStaleMs: 5 * 60 * 1000, // 5min
   catchUpSweepIdleMs: 15 * 60 * 1000, // 15min
 } as const;
+
+/**
+ * Body for POST /api/companies/:companyId/worker-learning-patterns
+ * (MCP tool upsert_worker_pattern). Upsert-noekkel: (worker_agent_id, pattern_tag).
+ */
+export const upsertWorkerPatternSchema = z.object({
+  workerAgentId: z.string().uuid(),
+  patternTag: z
+    .string()
+    .min(3)
+    .max(80)
+    .regex(/^[a-z0-9]+(?:_[a-z0-9]+){1,7}$/, "pattern_tag must be snake_case_2_to_8_tokens"),
+  patternDescription: z.string().min(3).max(1000),
+  exampleCorrect: z.string().max(500).optional(),
+  exampleWrong: z.string().max(500).optional(),
+  severity: z.enum(["info", "warning", "critical"]).default("warning"),
+});
+export type UpsertWorkerPatternInput = z.infer<typeof upsertWorkerPatternSchema>;

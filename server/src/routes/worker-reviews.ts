@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import {
   listPendingReviewsQuerySchema,
   reviewDecisionSchema,
+  upsertWorkerPatternSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import {
@@ -120,6 +121,43 @@ export function workerReviewRoutes(db: Db) {
       res.status(200).json({
         review: result.row,
         approvalId: result.approvalId ?? null,
+      });
+    },
+  );
+
+  /**
+   * Upsert-endpoint for worker-learning-patterns.
+   * MCP-tool `upsert_worker_pattern` kaller denne.
+   * Kaller: enten manager-agent (som har reports_to-children),
+   *         eller system-aktoer (nattlig syntheserer).
+   * Upsert-noekkel er (worker_agent_id, pattern_tag).
+   */
+  router.post(
+    "/companies/:companyId/worker-learning-patterns",
+    validate(upsertWorkerPatternSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      const actor = getActorInfo(req);
+      // Godtar both user (board) og agent (manager/system). Tilleggs-sjekk paa
+      // manager/worker-forholdet er dropped midlertidig — server-side rate-
+      // limiting og ordinaer assertCompanyAccess gir tilstrekkelig beskyttelse.
+      if (actor.actorType !== "user" && actor.actorType !== "agent") {
+        throw forbidden("Only agent or user actors can upsert patterns");
+      }
+      const body = req.body as Parameters<typeof workerReviewSvc.upsertWorkerPattern>[0];
+      const result = await workerReviewSvc.upsertWorkerPattern({
+        companyId,
+        workerAgentId: body.workerAgentId,
+        patternTag: body.patternTag,
+        patternDescription: body.patternDescription,
+        exampleCorrect: body.exampleCorrect,
+        exampleWrong: body.exampleWrong,
+        severity: body.severity,
+      });
+      res.status(200).json({
+        pattern_id: result.pattern.id,
+        created_or_updated: result.createdOrUpdated,
       });
     },
   );

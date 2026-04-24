@@ -607,6 +607,7 @@ export {
   submitReviewSchema,
   reviewDecisionSchema,
   listPendingReviewsQuerySchema,
+  upsertWorkerPatternSchema,
   WORKER_REVIEW_LIMITS,
   type ManagerReviewDecision,
   type WorkerReviewManagerStatus,
@@ -614,4 +615,22 @@ export {
   type SubmitReviewInput,
   type ReviewDecision,
   type ListPendingReviewsQuery,
+  type UpsertWorkerPatternInput,
 } from "./validators/index.js";
+
+export {
+  LIST_PENDING_REVIEWS_TOOL,
+  DECIDE_REVIEW_TOOL,
+  UPSERT_WORKER_PATTERN_TOOL,
+  MANAGER_REVIEW_TOOL_DEFINITIONS,
+  MANAGER_REVIEW_TOOL_NAMES,
+  isManagerReviewTool,
+  type ManagerReviewToolDefinition,
+  type ListPendingReviewsInput,
+  type ListPendingReviewsOutput,
+  type PendingReviewRow,
+  type DecideReviewInput,
+  type DecideReviewOutput,
+  type UpsertWorkerPatternToolInput,
+  type UpsertWorkerPatternToolOutput,
+} from "./manager-review-tools.js";

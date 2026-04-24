@@ -297,6 +297,7 @@ export {
   submitReviewSchema,
   reviewDecisionSchema,
   listPendingReviewsQuerySchema,
+  upsertWorkerPatternSchema,
   WORKER_REVIEW_LIMITS,
   type ManagerReviewDecision,
   type WorkerReviewManagerStatus,
@@ -304,4 +305,5 @@ export {
   type SubmitReviewInput,
   type ReviewDecision,
   type ListPendingReviewsQuery,
+  type UpsertWorkerPatternInput,
 } from "./worker-review.js";

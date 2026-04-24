@@ -5,13 +5,16 @@ import {
   agents,
   approvals,
   workerReviewLog,
+  workerLearningPatterns,
   type WorkerReviewLog,
   type NewWorkerReviewLog,
+  type WorkerLearningPattern,
 } from "@paperclipai/db";
 import {
   WORKER_REVIEW_LIMITS,
   type ManagerReviewDecision,
   type SubmitReviewInput,
+  type UpsertWorkerPatternInput,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -68,6 +71,41 @@ function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(encode(value));
 }
+
+/**
+ * Vi lagrer ikke severity i en egen kolonne (worker_learning_patterns
+ * har ikke severity). Vi koder den inn som en markoer-linje i
+ * pattern_description saa injection-rendringen kan lese den tilbake.
+ * Format: f.eks. foerste linje = "[severity=critical] <original description>".
+ * Hvis markoer mangler, anta warning.
+ */
+function extractSeverityFromDesc(
+  desc: string | null,
+): "info" | "warning" | "critical" {
+  if (!desc) return "warning";
+  const m = /^\[severity=(info|warning|critical)\]/u.exec(desc);
+  return (m?.[1] as "info" | "warning" | "critical" | undefined) ?? "warning";
+}
+
+function stripSeverityMarker(desc: string): string {
+  return desc.replace(/^\[severity=(info|warning|critical)\]\s*/u, "");
+}
+
+function formatDescriptionWithSeverity(
+  desc: string,
+  severity: "info" | "warning" | "critical",
+): string {
+  return "[severity=" + severity + "] " + stripSeverityMarker(desc);
+}
+
+function extractRationaleFromTask(row: WorkerReviewLog): string | null {
+  const payload = row.taskPayload as Record<string, unknown> | null;
+  if (!payload) return null;
+  const r = payload.rationale;
+  if (typeof r === "string" && r.trim().length > 0) return r;
+  return null;
+}
+
 
 export function computePayloadHash(payload: Record<string, unknown>): string {
   return createHash("sha256").update(canonicalJson(payload)).digest("hex");
@@ -279,6 +317,15 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
       .then((rows) => rows[0]);
 
     // 5. Heartbeat wakeup -- idempotent per review-id
+    // Vi hydraterer hele review-pakken slik at managerens context-snapshot
+    // har `currentReview` direkte tilgjengelig og dermed trenger ikke et
+    // ekstra HTTP-kall for detaljer.
+    let currentReview: Record<string, unknown> | null = null;
+    try {
+      currentReview = await hydrateReviewPacket(row.id);
+    } catch (err) {
+      logger.warn({ err, reviewId: row.id }, "worker_review: hydrateReviewPacket failed");
+    }
     try {
       await deps.heartbeat.wakeup(resolvedManagerId, {
         source: "automation",
@@ -289,10 +336,13 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         idempotencyKey: `review:${row.id}`,
         contextSnapshot: {
           source: "worker_review_hook",
+          wakeSource: "automation",
+          wakeReason: "manager_review_pending",
           reason: "manager_review_pending",
           reviewId: row.id,
           workerAgentId: input.workerAgentId,
           taskType: input.taskType,
+          currentReview,
         },
       });
     } catch (err) {
@@ -610,6 +660,155 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
       );
   }
 
+  /**
+   * Upsert et pattern for en worker-agent. Upsert-noekkel er
+   * (worker_agent_id, pattern_tag). Ved eksisterende rad: oeker
+   * occurrence_count, oppdaterer last_seen_at og velger strengeste severity.
+   */
+  async function upsertWorkerPattern(
+    input: UpsertWorkerPatternInput & { companyId: string },
+  ): Promise<{ pattern: WorkerLearningPattern; createdOrUpdated: "created" | "updated" }> {
+    const now = nowFn();
+    const exampleCorrectObj = input.exampleCorrect
+      ? { text: input.exampleCorrect }
+      : null;
+    const exampleWrongObj = input.exampleWrong ? { text: input.exampleWrong } : null;
+
+    const severityRank = { info: 1, warning: 2, critical: 3 } as const;
+
+    const existing = await db
+      .select()
+      .from(workerLearningPatterns)
+      .where(
+        and(
+          eq(workerLearningPatterns.workerAgentId, input.workerAgentId),
+          eq(workerLearningPatterns.patternTag, input.patternTag),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    if (!existing) {
+      const inserted = await db
+        .insert(workerLearningPatterns)
+        .values({
+          companyId: input.companyId,
+          workerAgentId: input.workerAgentId,
+          patternTag: input.patternTag,
+          patternDescription: formatDescriptionWithSeverity(
+            input.patternDescription,
+            input.severity,
+          ),
+          exampleCorrect: exampleCorrectObj,
+          exampleWrong: exampleWrongObj,
+          occurrenceCount: 1,
+          lastSeenAt: now,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: "manager",
+        action: "worker_pattern.created",
+        entityType: "worker_learning_pattern",
+        entityId: inserted.id,
+        agentId: input.workerAgentId,
+        details: { patternTag: input.patternTag, severity: input.severity },
+      });
+      return { pattern: inserted, createdOrUpdated: "created" };
+    }
+
+    const prevSev = extractSeverityFromDesc(existing.patternDescription);
+    const nextSev =
+      severityRank[input.severity] > severityRank[prevSev]
+        ? input.severity
+        : prevSev;
+    const nextDescription = formatDescriptionWithSeverity(
+      input.patternDescription,
+      nextSev,
+    );
+
+    const updated = await db
+      .update(workerLearningPatterns)
+      .set({
+        patternDescription: nextDescription,
+        exampleCorrect: exampleCorrectObj ?? existing.exampleCorrect,
+        exampleWrong: exampleWrongObj ?? existing.exampleWrong,
+        occurrenceCount: (existing.occurrenceCount ?? 1) + 1,
+        lastSeenAt: now,
+        updatedAt: now,
+      })
+      .where(eq(workerLearningPatterns.id, existing.id))
+      .returning()
+      .then((rows) => rows[0]);
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: "manager",
+      action: "worker_pattern.updated",
+      entityType: "worker_learning_pattern",
+      entityId: existing.id,
+      agentId: input.workerAgentId,
+      details: {
+        patternTag: input.patternTag,
+        severity: nextSev,
+        occurrenceCount: updated.occurrenceCount,
+      },
+    });
+    return { pattern: updated, createdOrUpdated: "updated" };
+  }
+
+  /**
+   * Bygger en normalisert review-pakke til injeksjon i contextSnapshot
+   * naar manager vekkes. Inkluderer parent-review-kjeden (opp til 3 hopp)
+   * saa manageren ser tidligere forsoek fra samme worker paa samme sak.
+   */
+  async function hydrateReviewPacket(
+    reviewId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const row = await getById(reviewId);
+    if (!row) return null;
+    const worker = await db
+      .select({ id: agents.id, name: agents.name })
+      .from(agents)
+      .where(eq(agents.id, row.workerAgentId))
+      .then((rows) => rows[0] ?? null);
+
+    const parentHistory: Array<Record<string, unknown>> = [];
+    let cursor: WorkerReviewLog | null = row;
+    let hops = 0;
+    while (cursor?.parentReviewId && hops < 3) {
+      const parent = await getById(cursor.parentReviewId);
+      if (!parent) break;
+      parentHistory.unshift({
+        review_id: parent.id,
+        manager_decision: parent.managerDecision,
+        manager_feedback: parent.managerFeedback,
+        attempt_count: parent.attemptCount ?? 0,
+        decided_at: parent.managerDecidedAt?.toISOString() ?? null,
+      });
+      cursor = parent;
+      hops += 1;
+    }
+
+    return {
+      review_id: row.id,
+      worker_agent_id: row.workerAgentId,
+      worker_name: worker?.name ?? null,
+      approval_type: row.taskType,
+      proposed_payload: row.workerOutput,
+      rationale: extractRationaleFromTask(row),
+      attempt_count: row.attemptCount ?? 0,
+      parent_review_history: parentHistory,
+      submitted_at: row.createdAt instanceof Date
+        ? row.createdAt.toISOString()
+        : new Date(row.createdAt as unknown as string).toISOString(),
+    };
+  }
+
   return {
     submitForReview,
     listPendingForManager,
@@ -624,6 +823,8 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
     oldestPendingAge,
     listManagerAgents,
     computePayloadHash,
+    upsertWorkerPattern,
+    hydrateReviewPacket,
   };
 }
 
