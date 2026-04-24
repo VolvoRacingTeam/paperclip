@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { and, eq } from "drizzle-orm";
+import { agents } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
   listPendingReviewsQuerySchema,
@@ -139,13 +141,30 @@ export function workerReviewRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
       const actor = getActorInfo(req);
-      // Godtar both user (board) og agent (manager/system). Tilleggs-sjekk paa
-      // manager/worker-forholdet er dropped midlertidig — server-side rate-
-      // limiting og ordinaer assertCompanyAccess gir tilstrekkelig beskyttelse.
       if (actor.actorType !== "user" && actor.actorType !== "agent") {
         throw forbidden("Only agent or user actors can upsert patterns");
       }
       const body = req.body as Parameters<typeof workerReviewSvc.upsertWorkerPattern>[0];
+
+      // Fix 12: agent-aktorer maa vaere manager (reports_to) for den gitte
+      // worker-agenten. User-aktorer (board) blir kun gated av
+      // assertCompanyAccess.
+      if (actor.actorType === "agent") {
+        if (!actor.actorId) {
+          throw forbidden("Agent actor mangler agentId");
+        }
+        const worker = await db.query.agents.findFirst({
+          where: and(
+            eq(agents.id, body.workerAgentId),
+            eq(agents.companyId, companyId),
+            eq(agents.reportsTo, actor.actorId),
+          ),
+        });
+        if (!worker) {
+          throw forbidden("Agent er ikke manager for denne worker (reports_to mismatch)");
+        }
+      }
+
       const result = await workerReviewSvc.upsertWorkerPattern({
         companyId,
         workerAgentId: body.workerAgentId,
