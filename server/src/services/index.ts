@@ -39,3 +39,4 @@ export {
   type ApprovalsDep,
 } from "./worker-review.js";
 export { workerLearningSynthesizer, type WorkerLearningSynthesizer, type SynthesisSummary } from "./worker-learning-synthesizer.js";
+export { workerLearningInjectionService, type WorkerLearningInjectionService } from "./worker-learning-injection.js";

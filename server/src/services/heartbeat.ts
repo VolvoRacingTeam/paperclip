@@ -1,3 +1,4 @@
+import { workerLearningInjectionService } from "./worker-learning-injection.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
@@ -2925,6 +2926,25 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      // Tier 1 worker-learning pattern injection (guarded by
+      // PAPERCLIP_WORKER_PATTERN_INJECTION_ENABLED env-var, default off).
+      // Kun for workers som ikke er nightly-synthesis-run og som har
+      // minst en laert pattern innenfor TTL.
+      try {
+        const wakeReason = typeof context.wakeReason === "string" ? context.wakeReason : "";
+        if (wakeReason !== "nightly_synthesis") {
+          const injection = workerLearningInjectionService(db);
+          const learnedMd = await injection.buildLearningMarkdownForWorker(
+            executionAgent.id,
+          );
+          if (learnedMd) {
+            context.paperclipLearnedPatternsMarkdown = learnedMd;
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, agentId: executionAgent.id }, "tier1 pattern injection failed");
+      }
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent: executionAgent,

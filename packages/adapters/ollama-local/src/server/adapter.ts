@@ -307,7 +307,13 @@ function extractUserMessage(ctx: AdapterExecutionContext): string {
 function extractSystemPrompt(ctx: AdapterExecutionContext): string | undefined {
   const c = (ctx.context ?? {}) as Record<string, unknown>;
   const sys = c.systemPrompt ?? c.system ?? c.instructions;
-  return typeof sys === "string" && sys.length > 0 ? sys : undefined;
+  const base = typeof sys === "string" && sys.length > 0 ? sys : undefined;
+  // Tier 1 injection: append learned-patterns markdown hvis servern la den ved.
+  const learned = c.paperclipLearnedPatternsMarkdown;
+  if (typeof learned === "string" && learned.length > 0) {
+    return (base ? base + "\n\n" : "") + learned;
+  }
+  return base;
 }
 
 function extractProjectId(ctx: AdapterExecutionContext): string {
