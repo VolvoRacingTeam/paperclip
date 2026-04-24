@@ -478,23 +478,36 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
       },
     };
     try {
-      const approval = await deps.approvals.create(row.companyId, {
-        type: row.taskType,
-        requestedByAgentId: row.workerAgentId,
-        requestedByUserId: null,
-        payload: payloadWithMeta,
-        status: "pending",
-        decisionNote: null,
-        decidedByUserId: null,
-        decidedAt: null,
-        updatedAt: new Date(),
-      } as Parameters<typeof deps.approvals.create>[1]);
-      if (!approval) return null;
-      await db
-        .update(workerReviewLog)
-        .set({ approvalId: approval.id, updatedAt: nowFn() })
-        .where(eq(workerReviewLog.id, row.id));
-      return approval.id;
+      // Fix 3: bruk transaksjon for aa unngaa zombie-rader (managerDecision
+      // satt til GODKJENT uten approvalId hvis approval-insert kaster).
+      // Vi inserter direkte i approvals-tabellen via tx fordi
+      // deps.approvals.create lukker over root-db. Hvis insert feiler,
+      // rulles UPDATE av workerReviewLog ogsaa tilbake.
+      const approvalId = await db.transaction(async (tx) => {
+        const inserted = await tx
+          .insert(approvals)
+          .values({
+            companyId: row.companyId,
+            type: row.taskType,
+            requestedByAgentId: row.workerAgentId,
+            requestedByUserId: null,
+            payload: payloadWithMeta,
+            status: "pending",
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: new Date(),
+          })
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!inserted) return null;
+        await tx
+          .update(workerReviewLog)
+          .set({ approvalId: inserted.id, updatedAt: nowFn() })
+          .where(eq(workerReviewLog.id, row.id));
+        return inserted.id;
+      });
+      return approvalId;
     } catch (err) {
       logger.error(
         { err, reviewId: row.id },

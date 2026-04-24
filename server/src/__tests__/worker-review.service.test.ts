@@ -93,17 +93,24 @@ function makeDb() {
       }),
     })),
     update: vi.fn(() => ({
-      set: (patch: any) => ({
-        where: () => ({
-          returning: () => {
-            state.updates.push(patch);
-            const row = state.rows[0]
-              ? { ...state.rows[0], ...patch, id: state.rows[0].id }
-              : null;
-            return Promise.resolve(row ? [row] : []);
+      set: (patch: any) => {
+        // Registrer patch for begge varianter (med og uten .returning()).
+        state.updates.push(patch);
+        return {
+          where: () => {
+            const thenable: any = {
+              returning: () => {
+                const row = state.rows[0]
+                  ? { ...state.rows[0], ...patch, id: state.rows[0].id }
+                  : null;
+                return Promise.resolve(row ? [row] : []);
+              },
+              then: (cb: any) => Promise.resolve(undefined).then(cb),
+            };
+            return thenable;
           },
-        }),
-      }),
+        };
+      },
     })),
     selectDistinct: vi.fn(() => selectBuilder([])) as any,
     __countCallIdx: 0,
@@ -262,5 +269,53 @@ describe("workerReviewService", () => {
     const h2 = computePayloadHash({ b: { y: 2, x: 1 }, a: 1 });
     expect(h1).toBe(h2);
     expect(h1).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  describe("promoteToApproval transaksjons-rollback (Fix 3)", () => {
+    it("hvis approvals.create kaster, propagerer feilen og review forblir AVVIST/uten approvalId", async () => {
+      // Vi mocker db.transaction til aa kalle callback med en tx-stub som
+      // kaster paa insert. Vi bekrefter at promoteToApproval kaster.
+      const db = makeDb();
+      const row = {
+        id: "review-fix3",
+        companyId: COMPANY_UUID,
+        workerAgentId: WORKER_UUID,
+        managerAgentId: MANAGER_UUID,
+        managerDecision: "PENDING",
+        idempotencyKey: null,
+        attemptCount: 0,
+        taskType: "bookkeeping_post",
+        taskPayload: {},
+        workerOutput: { x: 1 },
+        payloadHash: "hash",
+      };
+      db.__state.rows = [row];
+      // Inject db.transaction stub
+      (db as any).transaction = vi.fn(async (cb: any) => {
+        const tx = {
+          insert: () => ({
+            values: () => ({
+              returning: () => ({
+                then: () => Promise.reject(new Error("insert failed")),
+              }),
+            }),
+          }),
+          update: () => ({ set: () => ({ where: () => Promise.resolve([]) }) }),
+        };
+        return cb(tx);
+      });
+
+      const svc = workerReviewService(db as any, {
+        heartbeat,
+        approvals,
+        now: () => now,
+      });
+
+      await expect(
+        svc.recordManagerDecision(row.id, "approve", null, undefined, {
+          managerAgentId: MANAGER_UUID,
+        }),
+      ).rejects.toThrow(/insert failed/);
+    });
   });
 });
