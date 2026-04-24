@@ -54,12 +54,45 @@ export function approvalRoutes(db: Db) {
   router.get("/approvals/:id", async (req, res) => {
     const id = req.params.id as string;
     const approval = await svc.getById(id);
-    if (!approval) {
+    if (approval) {
+      assertCompanyAccess(req, approval.companyId);
+      res.json(redactApprovalPayload(approval));
+      return;
+    }
+    // Fix 4: hvis approval-raden ikke finnes, kan id-en vaere en worker_review_log-id
+    // (intercepten returnerer review.id som approval.id). Sjekk worker-review-log.
+    const reviewRow = await workerReviewSvc.getById(id);
+    if (!reviewRow) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
-    assertCompanyAccess(req, approval.companyId);
-    res.json(redactApprovalPayload(approval));
+    assertCompanyAccess(req, reviewRow.companyId);
+    // Hvis manageren har promotert til en approval senere, foelg den lenken.
+    if (reviewRow.approvalId) {
+      const promoted = await svc.getById(reviewRow.approvalId);
+      if (promoted) {
+        res.json(redactApprovalPayload(promoted));
+        return;
+      }
+    }
+    // Returner en "fake" approval-shape med ikke-terminalt status saa
+    // worker-SDK kan polle videre uten 404.
+    res.json({
+      id: reviewRow.id,
+      companyId: reviewRow.companyId,
+      type: reviewRow.taskType,
+      status: "pending_manager_review",
+      requestedByAgentId: reviewRow.workerAgentId,
+      requestedByUserId: null,
+      payload: redactEventPayload(reviewRow.workerOutput as Record<string, unknown>) ?? {},
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: reviewRow.createdAt,
+      updatedAt: reviewRow.updatedAt,
+      __worker_review: true,
+      __pending_review_id: reviewRow.id,
+    });
   });
 
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
