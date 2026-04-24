@@ -505,17 +505,40 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
   }
 
   async function queueWorkerRetry(row: WorkerReviewLog, feedback: string): Promise<void> {
-    const nextAttempt = (row.attemptCount ?? 0) + 1;
-    await db
-      .update(workerReviewLog)
-      .set({ attemptCount: nextAttempt, updatedAt: nowFn() })
-      .where(eq(workerReviewLog.id, row.id));
-
-    if (nextAttempt >= WORKER_REVIEW_LIMITS.maxRetries) {
-      // Eskaler
-      await escalate(row, `Max retries reached (${nextAttempt}). Last feedback: ${feedback}`);
+    // Fix 1+8 (off-by-one + idempotency-determinism):
+    // Idempotency-key avledes fra (row.id, row.attemptCount FOER UPDATE).
+    // Det betyr at hvis denne funksjonen re-invokes paa samme rad foer
+    // UPDATE har commited, faar vi samme idempotency-key.
+    const previousAttempt = row.attemptCount ?? 0;
+    const nextAttempt = previousAttempt + 1;
+    // Eskaler hvis dette overskrider maks retries (3. reject -> escalate).
+    // maxRetries=2 betyr: vi tillater 1. og 2. reject som retry, 3. -> escalate.
+    if (nextAttempt > WORKER_REVIEW_LIMITS.maxRetries) {
+      // Vi beholder attempt_count slik at audit-trail viser eskalering paa
+      // forsoek N+1, ikke pa et oppblast tall.
+      await db
+        .update(workerReviewLog)
+        .set({ attemptCount: nextAttempt, updatedAt: nowFn() })
+        .where(eq(workerReviewLog.id, row.id));
+      await escalate(
+        row,
+        `Max retries reached (${nextAttempt}). Last feedback: ${feedback}`,
+        { attemptCountOverride: nextAttempt },
+      );
       return;
     }
+
+    // Fix 5 (silent fault): Markeres PENDING_RETRY foer wakeup. Sweep
+    // ignorerer denne statusen slik at vi ikke fyrer dobbel-wakeup eller
+    // havner i en evig loop hvis wakeup feiler.
+    await db
+      .update(workerReviewLog)
+      .set({
+        managerDecision: "PENDING_RETRY",
+        attemptCount: nextAttempt,
+        updatedAt: nowFn(),
+      })
+      .where(eq(workerReviewLog.id, row.id));
 
     try {
       await deps.heartbeat.wakeup(row.workerAgentId, {
@@ -524,7 +547,7 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         reason: "manager_review_retry",
         requestedByActorType: "system",
         requestedByActorId: "worker_review_hook",
-        idempotencyKey: `review-retry:${row.id}:${nextAttempt}`,
+        idempotencyKey: `review-retry:${row.id}:${previousAttempt}`,
         contextSnapshot: {
           source: "worker_review_hook",
           reason: "manager_review_retry",
@@ -536,22 +559,39 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         },
       });
     } catch (err) {
-      logger.warn({ err, reviewId: row.id }, "worker_review: retry wakeup failed");
+      logger.warn(
+        { err, reviewId: row.id },
+        "worker_review: retry wakeup failed (rad er PENDING_RETRY; egen retry-sweep maa plukke opp)",
+      );
     }
 
+    // Fix 7: aktivitetslog for retry-enqueue
     await logActivity(db, {
       companyId: row.companyId,
       actorType: "system",
       actorId: "worker_review_hook",
-      action: "worker_review.retry_queued",
+      action: "worker_review.retry_enqueued",
       entityType: "worker_review",
       entityId: row.id,
       agentId: row.workerAgentId,
-      details: { attemptCount: nextAttempt, feedback },
+      details: {
+        reviewId: row.id,
+        workerAgentId: row.workerAgentId,
+        attemptCount: nextAttempt,
+        feedback,
+      },
     });
   }
 
-  async function escalate(row: WorkerReviewLog, managerNote: string): Promise<string | null> {
+  async function escalate(
+    row: WorkerReviewLog,
+    managerNote: string,
+    opts: { attemptCountOverride?: number } = {},
+  ): Promise<string | null> {
+    // Hvis caller (queueWorkerRetry) allerede har gjort UPDATE som
+    // inkrementerer attempt_count, vil row.attemptCount vaere foreldet.
+    // attemptCountOverride lar oss logge riktig tall.
+    const effectiveAttemptCount = opts.attemptCountOverride ?? row.attemptCount;
     const escalationPayload: Record<string, unknown> = {
       workerOutput: row.workerOutput,
       taskPayload: row.taskPayload,
@@ -562,7 +602,7 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         workerAgentId: row.workerAgentId,
         managerAgentId: row.managerAgentId,
         escalation: true,
-        attemptCount: row.attemptCount,
+        attemptCount: effectiveAttemptCount,
       },
     };
     try {
@@ -594,7 +634,11 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         entityType: "worker_review",
         entityId: row.id,
         agentId: row.managerAgentId ?? row.workerAgentId,
-        details: { approvalId: approval.id, managerNote },
+        details: {
+          approvalId: approval.id,
+          managerNote,
+          attemptCount: effectiveAttemptCount,
+        },
       });
       return approval.id;
     } catch (err) {

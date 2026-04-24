@@ -344,6 +344,13 @@
       "when": 1777123200000,
       "tag": "0048_worker_learning_archived_at",
       "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1777180800000,
+      "tag": "0049_son97_pending_retry",
+      "breakpoints": true
     }
   ]
 }
