@@ -4416,6 +4416,9 @@ export function heartbeatService(db: Db) {
       const catchUpIdleMs = 15 * 60 * 1000; // 15 min
       const minuteBucket = Math.floor(now.getTime() / 60000);
       try {
+        // Fix 9: aggregerende GROUP BY-query istedenfor N+1 per manager.
+        // Fix 5: PENDING ekskluderer PENDING_RETRY (worker-retry-koe), saa
+        // sweep vekker bare managere med faktisk ferske reviews.
         const pendingPerManager = await db
           .select({
             managerAgentId: workerReviewLog.managerAgentId,
@@ -4441,6 +4444,23 @@ export function heartbeatService(db: Db) {
             Number(bucket.pendingCount) > 0 &&
             (oldestAgeMs > catchUpStaleMs || idleMs > catchUpIdleMs);
           if (!shouldWake) continue;
+          // Fix 10: hopp over hvis budget-blokk gjelder; enqueueWakeup
+          // kaster conflict ved blokk. Vi pre-sjekker for aa unngaa stoy
+          // og slippe en unodvendig DB-skriving av agentWakeupRequests-rad.
+          const budgetBlock = await budgets
+            .getInvocationBlock(mgr.companyId, bucket.managerAgentId, {})
+            .catch(() => null);
+          if (budgetBlock) {
+            logger.info(
+              {
+                managerAgentId: bucket.managerAgentId,
+                pendingCount: Number(bucket.pendingCount),
+                budgetReason: budgetBlock.reason,
+              },
+              "worker_review sweep: skipper manager pga budget-blokk",
+            );
+            continue;
+          }
           await enqueueWakeup(bucket.managerAgentId, {
             source: "automation",
             triggerDetail: "system",
