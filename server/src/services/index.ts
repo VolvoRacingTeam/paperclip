@@ -38,3 +38,4 @@ export {
   type HeartbeatDep,
   type ApprovalsDep,
 } from "./worker-review.js";
+export { workerLearningSynthesizer, type WorkerLearningSynthesizer, type SynthesisSummary } from "./worker-learning-synthesizer.js";
