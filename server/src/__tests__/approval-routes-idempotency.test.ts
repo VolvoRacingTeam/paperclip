@@ -31,12 +31,34 @@ const mockSecretService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn().mockResolvedValue(null),
+}));
+
+const mockWorkerReviewService = vi.hoisted(() => ({
+  submitForReview: vi.fn(),
+  listPendingForManager: vi.fn(),
+  recordManagerDecision: vi.fn(),
+  promoteToApproval: vi.fn(),
+  queueWorkerRetry: vi.fn(),
+  escalate: vi.fn(),
+  recordHumanDecision: vi.fn(),
+  getById: vi.fn(),
+  countPending: vi.fn(),
+  countPendingForWorker: vi.fn(),
+  oldestPendingAge: vi.fn(),
+  listManagerAgents: vi.fn(),
+  computePayloadHash: vi.fn(),
+}));
+
 vi.mock("../services/index.js", () => ({
   approvalService: () => mockApprovalService,
   heartbeatService: () => mockHeartbeatService,
   issueApprovalService: () => mockIssueApprovalService,
   logActivity: mockLogActivity,
   secretService: () => mockSecretService,
+  agentService: () => mockAgentService,
+  workerReviewService: () => mockWorkerReviewService,
 }));
 
 function createApp() {
