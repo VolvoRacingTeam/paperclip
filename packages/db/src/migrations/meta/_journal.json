@@ -330,6 +330,13 @@
       "when": 1776207000000,
       "tag": "0046_sharp_leper_queen",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1777036800000,
+      "tag": "0047_manager_review_hook",
+      "breakpoints": true
     }
   ]
 }

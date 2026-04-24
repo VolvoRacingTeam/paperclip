@@ -59,3 +59,13 @@ export { pluginEntities } from "./plugin_entities.js";
 export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
+export {
+  workerReviewLog,
+  type WorkerReviewLog,
+  type NewWorkerReviewLog,
+} from "./worker_review_log.js";
+export {
+  workerLearningPatterns,
+  type WorkerLearningPattern,
+  type NewWorkerLearningPattern,
+} from "./worker_learning_patterns.js";

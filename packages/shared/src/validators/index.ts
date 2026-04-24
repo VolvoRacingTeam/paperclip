@@ -289,3 +289,19 @@ export {
   type SetPluginState,
   type ListPluginState,
 } from "./plugin.js";
+
+export {
+  managerReviewDecisionEnum,
+  workerReviewManagerStatusEnum,
+  workerReviewHumanDecisionEnum,
+  submitReviewSchema,
+  reviewDecisionSchema,
+  listPendingReviewsQuerySchema,
+  WORKER_REVIEW_LIMITS,
+  type ManagerReviewDecision,
+  type WorkerReviewManagerStatus,
+  type WorkerReviewHumanDecision,
+  type SubmitReviewInput,
+  type ReviewDecision,
+  type ListPendingReviewsQuery,
+} from "./worker-review.js";
