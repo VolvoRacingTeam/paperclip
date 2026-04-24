@@ -18,6 +18,7 @@ import {
   issues,
   projects,
   projectWorkspaces,
+  workerReviewLog,
 } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -4385,6 +4386,59 @@ export function heartbeatService(db: Db) {
         });
         if (run) enqueued += 1;
         else skipped += 1;
+      }
+
+      // Catch-up sweep for worker-review-hook:
+      // Vekker managere med ventende reviews som er for gamle eller som
+      // ikke har vaert aktive paa en stund. Bruker enqueueWakeup (aldri
+      // direkte DB-insert) slik at dedup/budget-check/idempotency gjelder.
+      const catchUpStaleMs = 5 * 60 * 1000; // 5 min
+      const catchUpIdleMs = 15 * 60 * 1000; // 15 min
+      const minuteBucket = Math.floor(now.getTime() / 60000);
+      try {
+        const pendingPerManager = await db
+          .select({
+            managerAgentId: workerReviewLog.managerAgentId,
+            pendingCount: sql<number>`count(*)::int`,
+            oldestAt: sql<Date>`min(${workerReviewLog.createdAt})`,
+          })
+          .from(workerReviewLog)
+          .where(eq(workerReviewLog.managerDecision, "PENDING"))
+          .groupBy(workerReviewLog.managerAgentId);
+
+        for (const bucket of pendingPerManager) {
+          if (!bucket.managerAgentId) continue;
+          const mgr = allAgents.find((a) => a.id === bucket.managerAgentId);
+          if (!mgr) continue;
+          if (mgr.status === "paused" || mgr.status === "terminated") continue;
+          const oldestMs = bucket.oldestAt ? new Date(bucket.oldestAt).getTime() : now.getTime();
+          const oldestAgeMs = now.getTime() - oldestMs;
+          const lastHbMs = mgr.lastHeartbeatAt
+            ? new Date(mgr.lastHeartbeatAt).getTime()
+            : 0;
+          const idleMs = now.getTime() - lastHbMs;
+          const shouldWake =
+            Number(bucket.pendingCount) > 0 &&
+            (oldestAgeMs > catchUpStaleMs || idleMs > catchUpIdleMs);
+          if (!shouldWake) continue;
+          await enqueueWakeup(bucket.managerAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "review_queue_sweep",
+            requestedByActorType: "system",
+            requestedByActorId: "worker_review_sweep",
+            idempotencyKey: `sweep:${bucket.managerAgentId}:${minuteBucket}`,
+            contextSnapshot: {
+              source: "worker_review_sweep",
+              reason: "review_queue_sweep",
+              pendingCount: Number(bucket.pendingCount),
+              oldestAgeMs,
+              managerAgentId: bucket.managerAgentId,
+            },
+          }).catch(() => null);
+        }
+      } catch (err) {
+        logger.warn({ err }, "worker_review sweep failed (non-fatal)");
       }
 
       return { checked, enqueued, skipped };
