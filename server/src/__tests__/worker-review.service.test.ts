@@ -271,6 +271,160 @@ describe("workerReviewService", () => {
     expect(h1).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  // ===================================================================
+  // QA-fixrunde 2026-04-25 (Fix 1, 2, 5, 8)
+  // ===================================================================
+
+  describe("queueWorkerRetry off-by-one fix (Fix 1+2)", () => {
+    /**
+     * Vi tester via recordManagerDecision('reject') paa en eksisterende rad.
+     * Vi setter attemptCount til 0/1/2 og verifiserer at:
+     *   attemptCount=0 -> retry (PENDING_RETRY) etter UPDATE
+     *   attemptCount=1 -> retry
+     *   attemptCount=2 -> escalate (3. forsoek)
+     */
+    function makeRowDb(initialAttemptCount: number, reviewId = "review-1") {
+      const db = makeDb();
+      const row = {
+        id: reviewId,
+        companyId: COMPANY_UUID,
+        workerAgentId: WORKER_UUID,
+        managerAgentId: MANAGER_UUID,
+        managerDecision: "PENDING",
+        idempotencyKey: null,
+        attemptCount: initialAttemptCount,
+        taskType: "bookkeeping_post",
+        taskPayload: {},
+        workerOutput: { x: 1 },
+        payloadHash: "hash",
+      };
+      db.__state.rows = [row];
+      return { db, row };
+    }
+
+    it("attemptCount=0 -> retry (ikke escalate)", async () => {
+      const { db, row } = makeRowDb(0, "review-fix1-a");
+      const svc = workerReviewService(db as any, {
+        heartbeat,
+        approvals,
+        now: () => now,
+      });
+      await svc.recordManagerDecision(
+        row.id,
+        "reject",
+        "feedback A",
+        undefined,
+        { managerAgentId: MANAGER_UUID },
+      );
+      expect(approvals.create).not.toHaveBeenCalled();
+      expect(heartbeat.calls.some((c) => c.opts.reason === "manager_review_retry")).toBe(true);
+    });
+
+    it("attemptCount=1 -> retry (ikke escalate)", async () => {
+      const { db, row } = makeRowDb(1, "review-fix1-b");
+      const svc = workerReviewService(db as any, {
+        heartbeat,
+        approvals,
+        now: () => now,
+      });
+      await svc.recordManagerDecision(
+        row.id,
+        "reject",
+        "feedback B",
+        undefined,
+        { managerAgentId: MANAGER_UUID },
+      );
+      expect(approvals.create).not.toHaveBeenCalled();
+      expect(heartbeat.calls.some((c) => c.opts.reason === "manager_review_retry")).toBe(true);
+    });
+
+    it("attemptCount=2 -> escalate (3. reject overskrider maxRetries=2)", async () => {
+      const { db, row } = makeRowDb(2, "review-fix1-c");
+      const svc = workerReviewService(db as any, {
+        heartbeat,
+        approvals,
+        now: () => now,
+      });
+      await svc.recordManagerDecision(
+        row.id,
+        "reject",
+        "feedback C",
+        undefined,
+        { managerAgentId: MANAGER_UUID },
+      );
+      expect(approvals.create).toHaveBeenCalled();
+      const escalationCall = (approvals.create as any).mock.calls[0];
+      expect(escalationCall[1].type).toBe("escalated_worker_action");
+      // Eskalerings-payload skal inneholde attemptCount=3 (effectiveAttemptCount-override)
+      expect(escalationCall[1].payload.__worker_review.attemptCount).toBe(3);
+      expect(heartbeat.calls.some((c) => c.opts.reason === "manager_review_retry")).toBe(false);
+    });
+  });
+
+  describe("idempotency-key determinism (Fix 8)", () => {
+    it("retry-key er avledet fra row.attemptCount FOER UPDATE", async () => {
+      const db = makeDb();
+      const row = {
+        id: "review-fix8",
+        companyId: COMPANY_UUID,
+        workerAgentId: WORKER_UUID,
+        managerAgentId: MANAGER_UUID,
+        managerDecision: "PENDING",
+        idempotencyKey: null,
+        attemptCount: 1,
+        taskType: "bookkeeping_post",
+        taskPayload: {},
+        workerOutput: { x: 1 },
+        payloadHash: "hash",
+      };
+      db.__state.rows = [row];
+      const svc = workerReviewService(db as any, {
+        heartbeat,
+        approvals,
+        now: () => now,
+      });
+      await svc.recordManagerDecision(row.id, "reject", "f", undefined, {
+        managerAgentId: MANAGER_UUID,
+      });
+      const retryCall = heartbeat.calls.find((c) => c.opts.reason === "manager_review_retry");
+      expect(retryCall).toBeTruthy();
+      expect(retryCall!.opts.idempotencyKey).toBe(`review-retry:${row.id}:1`);
+    });
+  });
+
+  describe("PENDING_RETRY mellomtilstand (Fix 5)", () => {
+    it("queueWorkerRetry setter raden i PENDING_RETRY foer wakeup", async () => {
+      const db = makeDb();
+      const row = {
+        id: "review-fix5",
+        companyId: COMPANY_UUID,
+        workerAgentId: WORKER_UUID,
+        managerAgentId: MANAGER_UUID,
+        managerDecision: "PENDING",
+        idempotencyKey: null,
+        attemptCount: 0,
+        taskType: "bookkeeping_post",
+        taskPayload: {},
+        workerOutput: { x: 1 },
+        payloadHash: "hash",
+      };
+      db.__state.rows = [row];
+      const svc = workerReviewService(db as any, {
+        heartbeat,
+        approvals,
+        now: () => now,
+      });
+      await svc.recordManagerDecision(row.id, "reject", "f", undefined, {
+        managerAgentId: MANAGER_UUID,
+      });
+      const retryUpdate = db.__state.updates.find(
+        (u: any) => u.managerDecision === "PENDING_RETRY",
+      );
+      expect(retryUpdate).toBeTruthy();
+      expect(retryUpdate.attemptCount).toBe(1);
+    });
+  });
+
   describe("promoteToApproval transaksjons-rollback (Fix 3)", () => {
     it("hvis approvals.create kaster, propagerer feilen og review forblir AVVIST/uten approvalId", async () => {
       // Vi mocker db.transaction til aa kalle callback med en tx-stub som
