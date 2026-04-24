@@ -9,6 +9,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "../components/StatusBadge";
 import { Identity } from "../components/Identity";
 import { approvalLabel, typeIcon, defaultTypeIcon, ApprovalPayloadRenderer } from "../components/ApprovalPayload";
+import { RedlineDiffView, isRedlinedPayload } from "../components/RedlineDiffView";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -217,6 +218,11 @@ export function ApprovalDetail() {
                 name={agentNameById.get(approval.requestedByAgentId) ?? approval.requestedByAgentId.slice(0, 8)}
                 size="sm"
               />
+            </div>
+          )}
+          {isRedlinedPayload(payload) && (
+            <div className="mt-3">
+              <RedlineDiffView payload={payload} />
             </div>
           )}
           <ApprovalPayloadRenderer type={approval.type} payload={payload} />

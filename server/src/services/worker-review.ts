@@ -478,6 +478,7 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
     redlinedPayload: Record<string, unknown> | undefined,
   ): Promise<string | null> {
     const finalPayload = redlinedPayload ?? (row.workerOutput as Record<string, unknown>);
+    const isRedlined = !!redlinedPayload;
     const payloadWithMeta: Record<string, unknown> = {
       ...finalPayload,
       __worker_review: {
@@ -486,8 +487,12 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         managerAgentId: row.managerAgentId,
         managerApprovedAt: row.managerDecidedAt?.toISOString() ?? new Date().toISOString(),
         originalPayloadHash: row.payloadHash,
-        redlinedByManager: !!redlinedPayload,
+        redlinedByManager: isRedlined,
+        // Pakke C (SON-97): inkluder original worker-payload kun naar manager
+        // har redlinet. UI-en bruker dette feltet for tre-kolonne diff-rendering.
+        ...(isRedlined ? { originalWorkerOutput: row.workerOutput as Record<string, unknown> } : {}),
       },
+      ...(isRedlined ? { __redlined_by_manager: true } : {}),
     };
     try {
       // Fix 3: bruk transaksjon for aa unngaa zombie-rader (managerDecision

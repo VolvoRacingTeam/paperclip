@@ -3,6 +3,7 @@ import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { Identity } from "./Identity";
 import { approvalLabel, typeIcon, defaultTypeIcon, ApprovalPayloadRenderer } from "./ApprovalPayload";
+import { RedlineBadge, isRedlinedPayload } from "./RedlineDiffView";
 import { timeAgo } from "../lib/timeAgo";
 import type { Approval, Agent } from "@paperclipai/shared";
 
@@ -60,6 +61,11 @@ export function ApprovalCard({
       </div>
 
       {/* Payload */}
+      {isRedlinedPayload(approval.payload) && (
+        <div className="mt-3">
+          <RedlineBadge />
+        </div>
+      )}
       <ApprovalPayloadRenderer type={approval.type} payload={approval.payload} />
 
       {/* Decision note */}
