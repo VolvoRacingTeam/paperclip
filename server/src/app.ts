@@ -30,6 +30,7 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
+import { wellKnownRoutes } from "./routes/well-known.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
@@ -127,6 +128,9 @@ export async function createApp(
   if (opts.betterAuthHandler) {
     app.all("/api/auth/*authPath", opts.betterAuthHandler);
   }
+  // Public JWKS endpoint for agent JWT verification (Task #26).
+  // Mounted directly on app (not under /api) and MUST remain publicly accessible.
+  app.use("/.well-known", wellKnownRoutes());
   app.use(llmRoutes(db));
 
   // Mount API routes
