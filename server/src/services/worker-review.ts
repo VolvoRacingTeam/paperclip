@@ -18,8 +18,119 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { sanitizeRecord } from "../redaction.js";
 import { logActivity } from "./activity-log.js";
 import type { approvalService } from "./approvals.js";
+
+/**
+ * SON-97 manager-redline guardrail: maks tillatt forhold mellom
+ * canonical-JSON-stoerrelsen paa redlined_payload og original
+ * worker_output. Manager-Sonnet skal kunne redigere felter, ikke
+ * fabrikere store nye datablokker. Cap = 1.2 (20 % vekst tolerert).
+ */
+export const ORIGINAL_SIZE_RATIO_CAP = 1.2;
+
+/**
+ * Sjekker at redlined_payload ikke har eksplodert i stoerrelse vs
+ * original. Returnerer ok=true ved akseptabel ratio.
+ */
+export function checkRedlineSizeCap(
+  original: unknown,
+  redlined: unknown,
+): { ok: boolean; reason?: string; originalBytes: number; redlinedBytes: number; ratio: number } {
+  const origStr = canonicalJson(original);
+  const redlineStr = canonicalJson(redlined);
+  const ratio = redlineStr.length / Math.max(origStr.length, 1);
+  if (ratio > ORIGINAL_SIZE_RATIO_CAP) {
+    return {
+      ok: false,
+      reason:
+        `redline_too_large: redlined_payload (${redlineStr.length} bytes) ` +
+        `exceeds ${(ORIGINAL_SIZE_RATIO_CAP * 100).toFixed(0)}% of original ` +
+        `(${origStr.length} bytes), ratio=${ratio.toFixed(2)}`,
+      originalBytes: origStr.length,
+      redlinedBytes: redlineStr.length,
+      ratio,
+    };
+  }
+  return { ok: true, originalBytes: origStr.length, redlinedBytes: redlineStr.length, ratio };
+}
+
+/**
+ * RFC 7396 JSON Merge Patch. Returnerer et patch-objekt slik at
+ *   apply(original, patch) = redlined
+ * Konvensjoner:
+ *   - Felt fjernet i redlined            -> patch[k] = null
+ *   - Felt lagt til/endret               -> patch[k] = nyVerdi
+ *   - Lik verdi paa begge sider          -> utelates
+ *   - Hvis enten side ikke er object     -> hele redlined returneres
+ *   - Arrays er atomiske (RFC 7396)      -> hele nye array hvis ulik
+ */
+export function computeJsonMergePatch(original: unknown, redlined: unknown): unknown {
+  if (
+    original === null ||
+    redlined === null ||
+    typeof original !== "object" ||
+    typeof redlined !== "object" ||
+    Array.isArray(original) ||
+    Array.isArray(redlined)
+  ) {
+    return redlined;
+  }
+  const origObj = original as Record<string, unknown>;
+  const redObj = redlined as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  // Slettede / endrede felter
+  for (const key of Object.keys(origObj)) {
+    if (!(key in redObj)) {
+      patch[key] = null;
+      continue;
+    }
+    const origVal = origObj[key];
+    const redVal = redObj[key];
+    // Identisk paa begge sider: utelat
+    if (canonicalJson(origVal) === canonicalJson(redVal)) continue;
+    // Begge er objekter -> rekurser
+    if (
+      origVal !== null &&
+      redVal !== null &&
+      typeof origVal === "object" &&
+      typeof redVal === "object" &&
+      !Array.isArray(origVal) &&
+      !Array.isArray(redVal)
+    ) {
+      patch[key] = computeJsonMergePatch(origVal, redVal);
+      continue;
+    }
+    patch[key] = redVal;
+  }
+  // Nye felter i redlined
+  for (const key of Object.keys(redObj)) {
+    if (!(key in origObj)) patch[key] = redObj[key];
+  }
+  return patch;
+}
+
+/**
+ * Topp-niva keys hvor patch faktisk endrer noe. Brukt for
+ * activity-log-detalj 'fields_changed'.
+ */
+export function topLevelChangedFields(original: unknown, redlined: unknown): string[] {
+  const fields = new Set<string>();
+  const origObj =
+    original !== null && typeof original === "object" && !Array.isArray(original)
+      ? (original as Record<string, unknown>)
+      : {};
+  const redObj =
+    redlined !== null && typeof redlined === "object" && !Array.isArray(redlined)
+      ? (redlined as Record<string, unknown>)
+      : {};
+  const keys = new Set([...Object.keys(origObj), ...Object.keys(redObj)]);
+  for (const k of keys) {
+    if (canonicalJson(origObj[k]) !== canonicalJson(redObj[k])) fields.add(k);
+  }
+  return Array.from(fields).sort();
+}
 
 /**
  * Heartbeat-dependency injisert (minimumsoverflate vi trenger).
@@ -406,6 +517,31 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
       throw conflict(`Review already in status ${existing.managerDecision}`);
     }
 
+    // SON-97 guardrail: hvis manager submitter en redlined_payload, sjekk at
+    // canonical-JSON-stoerrelsen ikke overstiger ORIGINAL_SIZE_RATIO_CAP av
+    // original worker_output. Dette stopper Sonnet fra aa fabrikere store
+    // datablokker som ikke representerer en faktisk redigering.
+    let redlineSizeCheck:
+      | ReturnType<typeof checkRedlineSizeCap>
+      | null = null;
+    let redlineDiff: unknown = null;
+    let redlineFieldsChanged: string[] = [];
+    if (redlinedPayload) {
+      const originalOutput = existing.workerOutput as Record<string, unknown> | null;
+      redlineSizeCheck = checkRedlineSizeCap(originalOutput, redlinedPayload);
+      if (!redlineSizeCheck.ok) {
+        throw unprocessable("redline_too_large", {
+          reason: redlineSizeCheck.reason,
+          originalBytes: redlineSizeCheck.originalBytes,
+          redlinedBytes: redlineSizeCheck.redlinedBytes,
+          ratio: Number(redlineSizeCheck.ratio.toFixed(4)),
+          cap: ORIGINAL_SIZE_RATIO_CAP,
+        });
+      }
+      redlineDiff = computeJsonMergePatch(originalOutput, redlinedPayload);
+      redlineFieldsChanged = topLevelChangedFields(originalOutput, redlinedPayload);
+    }
+
     const now = nowFn();
     const dbStatus = mapDecisionToDbStatus(decision);
     const reasoningPayload: Record<string, unknown> = {
@@ -458,6 +594,33 @@ export function workerReviewService(db: Db, deps: WorkerReviewServiceDeps) {
         hasRedline: !!redlinedPayload,
       },
     });
+
+    // SON-97: hvis manager redlinet, logg sanitized diff som egen
+    // event-type. logActivity sanitizer ogsaa selv, men vi gjoer det
+    // eksplisitt her for aa sikre at JWT-/secret-stringer i diff-feltet
+    // er redigert vekk uavhengig av noeklene rundt.
+    if (redlinedPayload && redlineSizeCheck) {
+      const diffWrapped =
+        redlineDiff !== null && typeof redlineDiff === "object" && !Array.isArray(redlineDiff)
+          ? sanitizeRecord(redlineDiff as Record<string, unknown>)
+          : redlineDiff;
+      await logActivity(db, {
+        companyId: updated.companyId,
+        actorType: "agent",
+        actorId: actor.managerAgentId,
+        action: "worker_review.redlined",
+        entityType: "worker_review",
+        entityId: updated.id,
+        agentId: actor.managerAgentId,
+        details: {
+          diff: diffWrapped,
+          original_size_bytes: redlineSizeCheck.originalBytes,
+          redlined_size_bytes: redlineSizeCheck.redlinedBytes,
+          ratio: Number(redlineSizeCheck.ratio.toFixed(4)),
+          fields_changed: redlineFieldsChanged,
+        },
+      });
+    }
 
     // Follow-up actions
     if (decision === "approve") {
