@@ -12,6 +12,18 @@
  * (server depends on adapters, not the reverse). Both callers MUST keep the
  * claims shape in lockstep with Kundeoversikt's verify-paperclip-jwt.ts.
  *
+ * 2026-04-24 spec alignment (from Kundeoversikt 02:15 CET):
+ *   - Outbound request JWT issuer is the bare hostname `paperclip.nullmas.no`
+ *     (no scheme). Kundeoversikt verifies against this exact string.
+ *   - sub is `agent:<agentId>` (prefixed) per their JWT shape.
+ *   - Mandatory claims: nbf (= iat), agent_id (raw, no prefix), organization_id.
+ *   - Per-request TTL is 90 seconds (was 600).
+ *   - Tool field is `tool` (not `tool_name`).
+ *   - Header carrying the JWT is `X-Paperclip-Agent-Claim` (set by callers).
+ *
+ * The legacy generic helper `signAgentEs256Jwt` keeps the original 600 s TTL
+ * and `https://...` issuer for any non-Kundeoversikt consumers.
+ *
  * The private key is loaded from (in order):
  *   1. PAPERCLIP_JWT_PRIVATE_KEY_PEM (full PEM, newline-separated).
  *   2. PAPERCLIP_JWT_PRIVATE_KEY_PATH (path to PEM file).
@@ -36,7 +48,11 @@ const DEFAULT_PRIVATE_KEY_PATH = "/paperclip/secrets/paperclip-es256-private.pem
 const DEFAULT_KID = "paperclip-2026-04";
 const DEFAULT_ISSUER = "https://paperclip.nullmas.no";
 const DEFAULT_AUDIENCE = "kundeoversikt.no";
-const DEFAULT_TTL_SECONDS = 10 * 60; // 10 minutes per Task #24 design
+const DEFAULT_TTL_SECONDS = 10 * 60; // 10 minutes per Task #24 design (legacy generic JWT)
+// Per-request JWT for Kundeoversikt outbound calls — spec-mandated 90 s TTL.
+const DEFAULT_REQUEST_TTL_SECONDS = 90;
+// Per-request JWT issuer per Kundeoversikt 2026-04-24 spec — bare hostname, no scheme.
+const DEFAULT_REQUEST_ISSUER = "paperclip.nullmas.no";
 
 export interface AgentJwtClaims {
   sub: string; // agent_id
@@ -205,9 +221,10 @@ export interface AgentRequestClaims {
   runId: string;
   toolName: string;
   method: string; // "GET" | "POST" | etc.
-  path: string;   // full path including query string
+  path: string;   // pathname + search (full path including query string)
   body?: unknown; // request body, will be SHA-256-hashed
-  companyId?: string;
+  organizationId: string; // Kundeoversikt-side organization UUID (Verkvelven). REQUIRED per spec.
+  companyId?: string;     // Paperclip-side company UUID (informational).
   adapterType?: string;
 }
 
@@ -226,24 +243,63 @@ export function computeBodySha256(body: unknown): string {
 
 /**
  * Sign a per-request agent JWT for outbound calls (Kundeoversikt etc.).
+ *
+ * Claims layout matches Kundeoversikt's verify-paperclip-jwt.ts (2026-04-24 spec):
+ *   - iss = paperclip.nullmas.no  (bare hostname; override with PAPERCLIP_JWT_REQUEST_ISSUER)
+ *   - aud = kundeoversikt.no
+ *   - sub = "agent:<agentId>"
+ *   - iat, nbf, exp (= iat + 90)
+ *   - jti = randomUUID()
+ *   - agent_id, run_id, organization_id
+ *   - body_sha256, tool, method, path
+ *
  * Server-side verifier checks body_sha256 matches the request body, that
  * method/path/tool match, and that jti has not been replayed.
  */
 export async function signRequestJwt(
   claims: AgentRequestClaims,
 ): Promise<string> {
+  const material = getEs256KeyMaterial();
+  if (!material) {
+    throw new Error(
+      "PAPERCLIP_JWT_PRIVATE_KEY not configured; cannot sign ES256 agent JWT",
+    );
+  }
+
+  const issuer = process.env.PAPERCLIP_JWT_REQUEST_ISSUER ?? DEFAULT_REQUEST_ISSUER;
+  const audience = process.env.PAPERCLIP_JWT_AUDIENCE ?? material.audience;
+  const ttlRaw = Number(process.env.PAPERCLIP_JWT_REQUEST_TTL_SECONDS);
+  const ttl = Number.isFinite(ttlRaw) && ttlRaw > 0
+    ? Math.floor(ttlRaw)
+    : DEFAULT_REQUEST_TTL_SECONDS;
+
+  const now = Math.floor(Date.now() / 1000);
   const bodySha256 = computeBodySha256(claims.body);
-  return signAgentEs256Jwt({
-    sub: claims.agentId,
+  const jti = randomUUID();
+  const sub = `agent:${claims.agentId}`;
+
+  const payload: Record<string, unknown> = {
+    agent_id: claims.agentId,
     run_id: claims.runId,
+    organization_id: claims.organizationId,
+    body_sha256: bodySha256,
     tool: claims.toolName,
     method: claims.method,
     path: claims.path,
-    body_sha256: bodySha256,
-    jti: randomUUID(),
-    company_id: claims.companyId,
-    adapter_type: claims.adapterType,
-  });
+  };
+  if (claims.companyId) payload.company_id = claims.companyId;
+  if (claims.adapterType) payload.adapter_type = claims.adapterType;
+
+  return await new SignJWT(payload)
+    .setProtectedHeader({ alg: "ES256", kid: material.kid, typ: "JWT" })
+    .setIssuer(issuer)
+    .setAudience(audience)
+    .setSubject(sub)
+    .setIssuedAt(now)
+    .setNotBefore(now)
+    .setExpirationTime(now + ttl)
+    .setJti(jti)
+    .sign(material.privateKey);
 }
 
 /**
@@ -255,4 +311,6 @@ export const _internals = {
   DEFAULT_ISSUER,
   DEFAULT_AUDIENCE,
   DEFAULT_TTL_SECONDS,
+  DEFAULT_REQUEST_TTL_SECONDS,
+  DEFAULT_REQUEST_ISSUER,
 };

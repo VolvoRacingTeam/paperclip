@@ -19,8 +19,10 @@ const ENV_KEYS = [
   "PAPERCLIP_JWT_PRIVATE_KEY_PATH",
   "PAPERCLIP_JWT_KID",
   "PAPERCLIP_JWT_ISSUER",
+  "PAPERCLIP_JWT_REQUEST_ISSUER",
   "PAPERCLIP_JWT_AUDIENCE",
   "PAPERCLIP_JWT_TTL_SECONDS",
+  "PAPERCLIP_JWT_REQUEST_TTL_SECONDS",
 ] as const;
 
 function snapshotEnv() {
@@ -39,6 +41,8 @@ function makeEcPrivatePem() {
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
   return privateKey.export({ format: "pem", type: "pkcs8" }).toString();
 }
+
+const VERKVELVEN_ORG_ID = "10ca8f03-1f23-4d63-a350-b6d0664ef5a4";
 
 describe("agent-jwt-es256", () => {
   const originalEnv = snapshotEnv();
@@ -164,13 +168,87 @@ describe("agent-jwt-es256", () => {
     });
   });
 
-  describe("signRequestJwt (Task #27)", () => {
+  describe("signRequestJwt — Kundeoversikt 2026-04-24 spec", () => {
     beforeEach(() => {
       process.env.PAPERCLIP_JWT_PRIVATE_KEY_PEM = makeEcPrivatePem();
       process.env.PAPERCLIP_JWT_KID = "paperclip-test";
+      // intentionally set generic ISSUER to https://... — request JWT must
+      // ignore it and use the bare hostname per spec.
       process.env.PAPERCLIP_JWT_ISSUER = "https://paperclip.nullmas.no";
       process.env.PAPERCLIP_JWT_AUDIENCE = "kundeoversikt.no";
       resetEs256KeyMaterialCache();
+    });
+
+    it("uses bare-hostname issuer 'paperclip.nullmas.no' (no scheme)", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        body: { hello: "world" },
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect(payload.iss).toBe("paperclip.nullmas.no");
+    });
+
+    it("subject is prefixed with 'agent:' and agent_id claim is raw", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "test-agent",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect(payload.sub).toBe("agent:test-agent");
+      expect(payload.agent_id).toBe("test-agent");
+    });
+
+    it("includes nbf == iat and exp == iat + 90 (90-second TTL per spec)", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect(typeof payload.iat).toBe("number");
+      expect(typeof payload.nbf).toBe("number");
+      expect(typeof payload.exp).toBe("number");
+      expect(payload.nbf).toBe(payload.iat);
+      expect((payload.exp as number) - (payload.iat as number)).toBe(90);
+    });
+
+    it("includes organization_id claim from caller", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect(payload.organization_id).toBe(VERKVELVEN_ORG_ID);
+    });
+
+    it("uses claim name 'tool' (not 'tool_name')", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_upsert_knowledge_note_draft",
+        method: "POST",
+        path: "/api/agent/upsert-knowledge-note-draft",
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect(payload.tool).toBe("kundeoversikt_upsert_knowledge_note_draft");
+      expect(payload.tool_name).toBeUndefined();
     });
 
     it("includes per-request claims method, path, tool, body_sha256, jti", async () => {
@@ -182,10 +260,10 @@ describe("agent-jwt-es256", () => {
         method: "POST",
         path: "/api/agent/drafts",
         body,
+        organizationId: VERKVELVEN_ORG_ID,
       });
 
       const payload = decodeJwt(jwt);
-      expect(payload.sub).toBe("agent-xyz");
       expect(payload.run_id).toBe("run-42");
       expect(payload.tool).toBe("kundeoversikt_create_draft_reply");
       expect(payload.method).toBe("POST");
@@ -202,6 +280,7 @@ describe("agent-jwt-es256", () => {
         toolName: "kundeoversikt_list_unprocessed_emails",
         method: "GET",
         path: "/api/agent/emails/unprocessed?limit=10",
+        organizationId: VERKVELVEN_ORG_ID,
       });
       const payload = decodeJwt(jwt);
       expect(payload.body_sha256).toBe(computeBodySha256(undefined));
@@ -215,6 +294,7 @@ describe("agent-jwt-es256", () => {
         toolName: "t",
         method: "GET",
         path: "/p",
+        organizationId: VERKVELVEN_ORG_ID,
       });
       const jwt2 = await signRequestJwt({
         agentId: "a",
@@ -222,13 +302,14 @@ describe("agent-jwt-es256", () => {
         toolName: "t",
         method: "GET",
         path: "/p",
+        organizationId: VERKVELVEN_ORG_ID,
       });
       const p1 = decodeJwt(jwt1);
       const p2 = decodeJwt(jwt2);
       expect(p1.jti).not.toBe(p2.jti);
     });
 
-    it("verifies against published JWKS with correct iss/aud/alg/kid", async () => {
+    it("verifies against published JWKS with bare-hostname issuer", async () => {
       const jwt = await signRequestJwt({
         agentId: "agent-1",
         runId: "run-1",
@@ -236,17 +317,48 @@ describe("agent-jwt-es256", () => {
         method: "POST",
         path: "/api/agent/actions",
         body: { actionType: "x" },
+        organizationId: VERKVELVEN_ORG_ID,
       });
 
       const jwks = buildJwksDocument();
       const keySet = createLocalJWKSet(jwks as Parameters<typeof createLocalJWKSet>[0]);
       const { payload, protectedHeader } = await jwtVerify(jwt, keySet, {
-        issuer: "https://paperclip.nullmas.no",
+        issuer: "paperclip.nullmas.no",
         audience: "kundeoversikt.no",
       });
       expect(protectedHeader.alg).toBe("ES256");
       expect(protectedHeader.kid).toBe("paperclip-test");
       expect(payload.tool).toBe("kundeoversikt_log_action");
+      expect(payload.sub).toBe("agent:agent-1");
+      expect(payload.organization_id).toBe(VERKVELVEN_ORG_ID);
+    });
+
+    it("respects PAPERCLIP_JWT_REQUEST_TTL_SECONDS override", async () => {
+      process.env.PAPERCLIP_JWT_REQUEST_TTL_SECONDS = "120";
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect((payload.exp as number) - (payload.iat as number)).toBe(120);
+    });
+
+    it("respects PAPERCLIP_JWT_REQUEST_ISSUER override", async () => {
+      process.env.PAPERCLIP_JWT_REQUEST_ISSUER = "paperclip-staging.nullmas.no";
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        organizationId: VERKVELVEN_ORG_ID,
+      });
+      const payload = decodeJwt(jwt);
+      expect(payload.iss).toBe("paperclip-staging.nullmas.no");
     });
   });
 });

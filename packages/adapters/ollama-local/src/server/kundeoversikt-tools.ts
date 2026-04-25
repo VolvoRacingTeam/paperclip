@@ -6,9 +6,14 @@
  * bokføringsrevisjoner.
  *
  * Environment variables (set in /opt/paperclip/.env):
- *   AGENT_API_KEY            — Bearer token for Kundeoversikt agent API
+ *   AGENT_API_KEY            — Bearer token for Kundeoversikt agent API (legacy fallback)
  *   KUNDEOVERSIKT_DRAFTS_URL — Base URL for drafts endpoint
- *   KUNDEOVERSIKT_ORG_ID     — Organization UUID for Verkvelven AS
+ *   KUNDEOVERSIKT_ORG_ID     — Organization UUID for Verkvelven AS (used both as
+ *                              query param and as JWT organization_id claim)
+ *   PAPERCLIP_AGENT_JWT_ENABLED — Feature flag (true/false). When true and a per-run
+ *                              JWT context is available, outbound calls use
+ *                              `X-Paperclip-Agent-Claim: <ES256-JWT>` instead of Bearer.
+ *                              Default false. Canary onsdag 2026-04-29.
  */
 
 import fs from "node:fs/promises";
@@ -21,6 +26,11 @@ import {
   parseRateLimitHeaders,
 } from "./rate-limit-client.js";
 import type { ToolDefinition } from "./schema.js";
+import {
+  isAgentJwtEnabled,
+  signedFetch,
+  type JwtRequestContext,
+} from "./signed-fetch.js";
 
 type ToolError = {
   error: string;
@@ -124,6 +134,45 @@ function apiKey(): string {
   return env("AGENT_API_KEY");
 }
 
+// ---------------------------------------------------------------------------
+// Per-call JWT context (set by executeKundeoversiktTool, read by agentFetch helpers).
+// Synchronous because executeKundeoversiktTool is single-flight per call —
+// each tool invocation completes before another can begin within the same run.
+// ---------------------------------------------------------------------------
+
+export interface KundeoversiktCallContext {
+  agentId: string;
+  runId: string;
+  /** Optional Paperclip-side companyId — surfaced as `company_id` claim only. */
+  companyId?: string;
+  /** Adapter type ("ollama_local") — surfaced as `adapter_type` claim only. */
+  adapterType?: string;
+}
+
+let currentCallContext: KundeoversiktCallContext | null = null;
+let currentToolName: string | null = null;
+
+function buildJwtContextForCurrentCall(): JwtRequestContext | null {
+  if (!isAgentJwtEnabled()) return null;
+  if (!currentCallContext || !currentToolName) return null;
+  const organizationId = process.env.KUNDEOVERSIKT_ORG_ID?.trim();
+  if (!organizationId) {
+    console.warn(
+      "[kundeoversikt] PAPERCLIP_AGENT_JWT_ENABLED=true but KUNDEOVERSIKT_ORG_ID not set; falling back to Bearer.",
+    );
+    return null;
+  }
+  return {
+    agentId: currentCallContext.agentId,
+    runId: currentCallContext.runId,
+    toolName: currentToolName,
+    organizationId,
+    companyId: currentCallContext.companyId,
+    adapterType: currentCallContext.adapterType ?? "ollama_local",
+  };
+}
+
+
 function dryRunEnabled(): boolean {
   return (process.env.PAPERCLIP_DRY_RUN ?? "false").trim().toLowerCase() === "true";
 }
@@ -162,17 +211,36 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
   const dryRunLog = dryRunEnabled();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
+  const jwtCtx = buildJwtContextForCurrentCall();
   try {
-    const res = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${apiKey()}`,
-        "Content-Type": "application/json",
-        ...(options?.headers as Record<string, string> ?? {}),
-        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
-      },
-    });
+    const baseHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...((options?.headers as Record<string, string>) ?? {}),
+      ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
+    };
+    let res: Response;
+    if (jwtCtx) {
+      res = await signedFetch(
+        url,
+        {
+          ...options,
+          method,
+          signal: controller.signal,
+          headers: baseHeaders,
+          body: typeof options?.body === "string" ? options.body : undefined,
+        },
+        jwtCtx,
+      );
+    } else {
+      res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey()}`,
+          ...baseHeaders,
+        },
+      });
+    }
     const body = await res.json() as Record<string, unknown>;
     if (dryRunLog) {
       await appendDryRunLog({
@@ -371,19 +439,38 @@ async function agentBookkeepingFetch(
   const dryRunLog = dryRunEnabled();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
+  const jwtCtx = buildJwtContextForCurrentCall();
 
   try {
-    const res = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${apiKey()}`,
-        "Content-Type": "application/json",
-        "X-Paperclip-Contract-Version": "1",
-        ...(options?.headers as Record<string, string> ?? {}),
-        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
-      },
-    });
+    const baseHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Paperclip-Contract-Version": "1",
+      ...((options?.headers as Record<string, string>) ?? {}),
+      ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
+    };
+    let res: Response;
+    if (jwtCtx) {
+      res = await signedFetch(
+        url,
+        {
+          ...options,
+          method,
+          signal: controller.signal,
+          headers: baseHeaders,
+          body: typeof options?.body === "string" ? options.body : undefined,
+        },
+        jwtCtx,
+      );
+    } else {
+      res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey()}`,
+          ...baseHeaders,
+        },
+      });
+    }
 
     const rawText = await res.text();
     let body: unknown = null;
@@ -754,6 +841,25 @@ function noteLegacyAlias(
 }
 
 export async function executeKundeoversiktTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  callContext?: KundeoversiktCallContext,
+): Promise<unknown> {
+  // Establish per-call JWT context. Synchronous because tool execution is
+  // single-flight per agent run within executeKundeoversiktTool.
+  const previousCtx = currentCallContext;
+  const previousTool = currentToolName;
+  currentCallContext = callContext ?? null;
+  currentToolName = toolName;
+  try {
+    return await runKundeoversiktTool(toolName, args);
+  } finally {
+    currentCallContext = previousCtx;
+    currentToolName = previousTool;
+  }
+}
+
+async function runKundeoversiktTool(
   toolName: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {

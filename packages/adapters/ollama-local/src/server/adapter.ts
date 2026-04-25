@@ -121,7 +121,12 @@ export async function executeAdapter(
   const projectId = extractProjectId(ctx);
   const executeTool: ToolExecutor = async (name, args) => {
     if (isKundeoversiktTool(name)) {
-      return executeKundeoversiktTool(name, args);
+      return executeKundeoversiktTool(name, args, {
+        agentId: ctx.agent.id,
+        runId: ctx.runId,
+        companyId: ctx.agent.companyId,
+        adapterType: "ollama_local",
+      });
     }
     if (isFikenTool(name)) {
       return executeFikenTool(name, args);
