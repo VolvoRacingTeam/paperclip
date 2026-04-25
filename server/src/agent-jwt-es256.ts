@@ -6,6 +6,12 @@
  * verify them by fetching the public key from
  *   https://paperclip.nullmas.no/.well-known/jwks.json
  *
+ * Task #27 (2026-04-24): Adds signRequestJwt() helper for per-request claims
+ * (method/path/tool/body_sha256/jti). Adapter-side outbound fetch wrappers
+ * mirror this contract independently to avoid a circular workspace dependency
+ * (server depends on adapters, not the reverse). Both callers MUST keep the
+ * claims shape in lockstep with Kundeoversikt's verify-paperclip-jwt.ts.
+ *
  * The private key is loaded from (in order):
  *   1. PAPERCLIP_JWT_PRIVATE_KEY_PEM (full PEM, newline-separated).
  *   2. PAPERCLIP_JWT_PRIVATE_KEY_PATH (path to PEM file).
@@ -17,8 +23,14 @@
  */
 
 import { readFileSync } from "node:fs";
-import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
-import { SignJWT, exportJWK, type JWK } from "jose";
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  randomUUID,
+  type KeyObject,
+} from "node:crypto";
+import { SignJWT, type JWK } from "jose";
 
 const DEFAULT_PRIVATE_KEY_PATH = "/paperclip/secrets/paperclip-es256-private.pem";
 const DEFAULT_KID = "paperclip-2026-04";
@@ -179,6 +191,59 @@ export async function signAgentEs256Jwt(
     .setExpirationTime(Math.floor(Date.now() / 1000) + ttl)
     .setJti(jti)
     .sign(material.privateKey);
+}
+
+/**
+ * Per-request claims used by Paperclip agent fetch wrappers (ollama_local etc.).
+ *
+ * Kundeoversikt's verify-paperclip-jwt.ts validates body_sha256 matches
+ * SHA-256(request.body), jti uniqueness (Redis-replay 11 min TTL), and that
+ * method/path/tool match the actual HTTP request.
+ */
+export interface AgentRequestClaims {
+  agentId: string;
+  runId: string;
+  toolName: string;
+  method: string; // "GET" | "POST" | etc.
+  path: string;   // full path including query string
+  body?: unknown; // request body, will be SHA-256-hashed
+  companyId?: string;
+  adapterType?: string;
+}
+
+/**
+ * Compute hex SHA-256 of the canonical body string (empty string for no body).
+ * Exported for tests and adapter-side helpers that re-implement signing
+ * (the adapter package has no @paperclipai/server dependency on purpose).
+ */
+export function computeBodySha256(body: unknown): string {
+  let bodyStr = "";
+  if (body !== undefined && body !== null) {
+    bodyStr = typeof body === "string" ? body : JSON.stringify(body);
+  }
+  return createHash("sha256").update(bodyStr).digest("hex");
+}
+
+/**
+ * Sign a per-request agent JWT for outbound calls (Kundeoversikt etc.).
+ * Server-side verifier checks body_sha256 matches the request body, that
+ * method/path/tool match, and that jti has not been replayed.
+ */
+export async function signRequestJwt(
+  claims: AgentRequestClaims,
+): Promise<string> {
+  const bodySha256 = computeBodySha256(claims.body);
+  return signAgentEs256Jwt({
+    sub: claims.agentId,
+    run_id: claims.runId,
+    tool: claims.toolName,
+    method: claims.method,
+    path: claims.path,
+    body_sha256: bodySha256,
+    jti: randomUUID(),
+    company_id: claims.companyId,
+    adapter_type: claims.adapterType,
+  });
 }
 
 /**

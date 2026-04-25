@@ -2,14 +2,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { generateKeyPairSync } from "node:crypto";
-import { createLocalJWKSet, jwtVerify } from "jose";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
 
 import {
   buildJwksDocument,
+  computeBodySha256,
   getEs256KeyMaterial,
   resetEs256KeyMaterialCache,
   signAgentEs256Jwt,
+  signRequestJwt,
 } from "../agent-jwt-es256.js";
 
 const ENV_KEYS = [
@@ -134,5 +136,117 @@ describe("agent-jwt-es256", () => {
     const pem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
     process.env.PAPERCLIP_JWT_PRIVATE_KEY_PEM = pem;
     expect(() => getEs256KeyMaterial()).toThrow(/EC \(P-256\)/);
+  });
+
+  describe("computeBodySha256 (Task #27)", () => {
+    it("returns SHA-256 of empty string when body is undefined", () => {
+      const expected = createHash("sha256").update("").digest("hex");
+      expect(computeBodySha256(undefined)).toBe(expected);
+    });
+
+    it("returns SHA-256 of empty string when body is null", () => {
+      const expected = createHash("sha256").update("").digest("hex");
+      expect(computeBodySha256(null)).toBe(expected);
+    });
+
+    it("returns SHA-256 of JSON.stringify(body) for objects", () => {
+      const body = { a: 1, b: "x" };
+      const expected = createHash("sha256")
+        .update(JSON.stringify(body))
+        .digest("hex");
+      expect(computeBodySha256(body)).toBe(expected);
+    });
+
+    it("returns SHA-256 of the raw string when body is already a string", () => {
+      const body = '{"already":"serialized"}';
+      const expected = createHash("sha256").update(body).digest("hex");
+      expect(computeBodySha256(body)).toBe(expected);
+    });
+  });
+
+  describe("signRequestJwt (Task #27)", () => {
+    beforeEach(() => {
+      process.env.PAPERCLIP_JWT_PRIVATE_KEY_PEM = makeEcPrivatePem();
+      process.env.PAPERCLIP_JWT_KID = "paperclip-test";
+      process.env.PAPERCLIP_JWT_ISSUER = "https://paperclip.nullmas.no";
+      process.env.PAPERCLIP_JWT_AUDIENCE = "kundeoversikt.no";
+      resetEs256KeyMaterialCache();
+    });
+
+    it("includes per-request claims method, path, tool, body_sha256, jti", async () => {
+      const body = { hello: "world" };
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_create_draft_reply",
+        method: "POST",
+        path: "/api/agent/drafts",
+        body,
+      });
+
+      const payload = decodeJwt(jwt);
+      expect(payload.sub).toBe("agent-xyz");
+      expect(payload.run_id).toBe("run-42");
+      expect(payload.tool).toBe("kundeoversikt_create_draft_reply");
+      expect(payload.method).toBe("POST");
+      expect(payload.path).toBe("/api/agent/drafts");
+      expect(payload.body_sha256).toBe(computeBodySha256(body));
+      expect(typeof payload.jti).toBe("string");
+      expect((payload.jti as string).length).toBeGreaterThan(8);
+    });
+
+    it("computes body_sha256 of empty string when no body is provided (GET)", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "agent-xyz",
+        runId: "run-42",
+        toolName: "kundeoversikt_list_unprocessed_emails",
+        method: "GET",
+        path: "/api/agent/emails/unprocessed?limit=10",
+      });
+      const payload = decodeJwt(jwt);
+      expect(payload.body_sha256).toBe(computeBodySha256(undefined));
+      expect(payload.method).toBe("GET");
+    });
+
+    it("produces unique jti per call", async () => {
+      const jwt1 = await signRequestJwt({
+        agentId: "a",
+        runId: "r",
+        toolName: "t",
+        method: "GET",
+        path: "/p",
+      });
+      const jwt2 = await signRequestJwt({
+        agentId: "a",
+        runId: "r",
+        toolName: "t",
+        method: "GET",
+        path: "/p",
+      });
+      const p1 = decodeJwt(jwt1);
+      const p2 = decodeJwt(jwt2);
+      expect(p1.jti).not.toBe(p2.jti);
+    });
+
+    it("verifies against published JWKS with correct iss/aud/alg/kid", async () => {
+      const jwt = await signRequestJwt({
+        agentId: "agent-1",
+        runId: "run-1",
+        toolName: "kundeoversikt_log_action",
+        method: "POST",
+        path: "/api/agent/actions",
+        body: { actionType: "x" },
+      });
+
+      const jwks = buildJwksDocument();
+      const keySet = createLocalJWKSet(jwks as Parameters<typeof createLocalJWKSet>[0]);
+      const { payload, protectedHeader } = await jwtVerify(jwt, keySet, {
+        issuer: "https://paperclip.nullmas.no",
+        audience: "kundeoversikt.no",
+      });
+      expect(protectedHeader.alg).toBe("ES256");
+      expect(protectedHeader.kid).toBe("paperclip-test");
+      expect(payload.tool).toBe("kundeoversikt_log_action");
+    });
   });
 });
