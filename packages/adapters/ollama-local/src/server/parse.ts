@@ -52,9 +52,18 @@ export function parseToolResponse(raw: string): ParsedResponse {
     return { kind: "error", error: "empty response", raw: raw ?? "" };
   }
 
+  // Strip markdown code fences if present (e.g. ```json...```).
+  // Many local models (GLM-4.7-Flash, Qwen3-Coder, Heretic) wrap JSON
+  // in markdown by default. Paperclip-protokollen krever ren JSON.
+  let cleaned = raw.trim();
+  const fenceMatch = cleaned.match(/^```(?:json|text)?\s*\n?([\s\S]*?)\n?```\s*$/);
+  if (fenceMatch) {
+    cleaned = fenceMatch[1].trim();
+  }
+
   let data: unknown;
   try {
-    data = JSON.parse(raw);
+    data = JSON.parse(cleaned);
   } catch (err) {
     return {
       kind: "error",
