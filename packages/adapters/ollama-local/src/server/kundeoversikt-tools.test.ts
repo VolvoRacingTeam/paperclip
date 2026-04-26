@@ -142,9 +142,15 @@ describe("executeKundeoversiktTool bookkeeping tools", () => {
     );
   });
 
-  it("gjør backoff ved 429 før strukturert feil returneres", async () => {
+  it("retrier én gang ved 429 og returnerer diskriminert RATE_LIMITED-feil hvis retry også feiler", async () => {
+    // Quinn fix #1: agentBookkeepingFetch går nå gjennom samme rate-limit-
+    // executor som agentFetch, slik at knowledge-note og bookkeeping-tools
+    // får cache-gate + 429-retry uniformt. Den gamle testen forventet at
+    // 429-respons ble returnert direkte via normalizeErrorResponse uten
+    // retry. Ny atferd: vent Retry-After (1s) → retry → 429 → returner
+    // diskriminert RateLimitedToolError.
     vi.useFakeTimers();
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(
         { error: "For mange forespørsler", code: "RATE_LIMITED" },
         {
@@ -166,12 +172,15 @@ describe("executeKundeoversiktTool bookkeeping tools", () => {
       },
     );
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(1_500);
     const result = await pending;
 
-    expect(result).toEqual({
-      error: "For mange forespørsler",
-      code: "RATE_LIMITED",
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      error: "RATE_LIMITED",
+      attempts: 2,
+      source: "server",
+      retryAfter: 1,
     });
   });
 

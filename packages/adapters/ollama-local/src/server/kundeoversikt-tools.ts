@@ -16,6 +16,7 @@
  *                              Default false. Canary onsdag 2026-04-29.
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -107,9 +108,49 @@ type RevisionSubmissionResponse = {
   idempotent_replay?: unknown;
 };
 
+type KnowledgeNoteDraftResponse = {
+  status?: unknown;
+  noteId?: unknown;
+  revisionId?: unknown;
+  queueId?: unknown;
+  basedOnRevisionId?: unknown;
+  diffPreview?: unknown;
+  embeddingStatus?: unknown;
+  requiresToreReview?: unknown;
+};
+
+const KNOWLEDGE_NOTE_TYPES = [
+  "accounting_rule",
+  "customer_exception",
+  "vendor_mapping",
+  "vat_rule",
+  "tone_preference",
+  "stop_rule",
+  "compliance_rule",
+] as const;
+type KnowledgeNoteType = (typeof KNOWLEDGE_NOTE_TYPES)[number];
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LEARNING_DISABLED_SUPPRESS_MS = 5 * 60 * 1000;
 const learningDisabledSuppress = new Map<string, number>();
+
+/**
+ * Deterministic idempotency key for knowledge-note drafts.
+ *
+ * Spec: sha256(`${runId}:${customerId}:${noteKey}`).slice(0, 32)
+ * — same runId+customerId+noteKey → same key, så en retry treffer
+ * Kundeoversikts idempotency-cache i stedet for å lage duplikater.
+ */
+export function computeKnowledgeNoteDraftIdempotencyKey(
+  runId: string,
+  customerId: string,
+  noteKey: string,
+): string {
+  return createHash("sha256")
+    .update(`${runId}:${customerId}:${noteKey}`)
+    .digest("hex")
+    .slice(0, 32);
+}
 
 // ---------------------------------------------------------------------------
 // Config from environment
@@ -204,35 +245,209 @@ async function appendDryRunLog(entry: Record<string, unknown>): Promise<void> {
 // HTTP helper
 // ---------------------------------------------------------------------------
 
-async function agentFetch(path: string, options?: RequestInit): Promise<unknown> {
+/**
+ * Shared rate-limit aware fetch executor used by BOTH `agentFetch()` and
+ * `agentBookkeepingFetch()`. Quinn finding #1: previously only `agentFetch`
+ * had pre-call cache gate + 429-retry. Knowledge-note draft routes through
+ * `agentBookkeepingFetch` and therefore bypassed the cache + retry — a 429
+ * was returned to the agent immediately with no respect for Retry-After
+ * and no cache update.
+ *
+ * Returns either a successful `Response` (caller decodes body itself) or
+ * a `RateLimitedToolError` (caller propagates verbatim).
+ *
+ * Rate-limit handling (SON-97):
+ *   1. Pre-call cache-gate — short-circuits with source:'cache'.
+ *   2. Post-call success — cache headers per bucket.
+ *   3. Post-call 429 — backoff <=60s ⇒ ÉN retry; >60s ⇒ RATE_LIMITED.
+ */
+type FetchWithRateLimitResult =
+  | { kind: "response"; res: Response; attempts: number }
+  | { kind: "rate_limited"; err: RateLimitedToolError };
+
+async function executeFetchWithRateLimit(
+  performFetch: () => Promise<Response>,
+  opts: {
+    buckets: string[];
+    toolNameForLog: string;
+    requestPath: string;
+    method: string;
+    dryRunLog: boolean;
+  },
+): Promise<FetchWithRateLimitResult> {
+  const { buckets, toolNameForLog, requestPath, method, dryRunLog } = opts;
+
+  // --- Pre-call cache gate -------------------------------------------------
+  const nowMs = Date.now();
+  const cached = getCachedBackoffMs(buckets, nowMs);
+  if (cached.waitMs > 0) {
+    const retryAfter = Math.ceil(cached.waitMs / 1000);
+    console.warn(
+      `[kundeoversikt] ${toolNameForLog}: rate-limit pre-call short-circuit ` +
+        `bucket=${cached.bucket ?? "?"} retryAfter=${retryAfter}s ` +
+        `(event=kundeoversikt_rate_limit_hit source=cache)`,
+    );
+    if (dryRunLog) {
+      await appendDryRunLog({
+        system: "kundeoversikt",
+        method,
+        path: requestPath,
+        rateLimited: true,
+        source: "cache",
+        bucket: cached.bucket,
+        retryAfter,
+      });
+    }
+    return {
+      kind: "rate_limited",
+      err: {
+        error: "RATE_LIMITED",
+        code: "RATE_LIMITED",
+        retriable: true,
+        hint: RATE_LIMITED_HINT,
+        retryAfter,
+        bucket: cached.bucket,
+        attempts: 0,
+        source: "cache",
+      },
+    };
+  }
+
+  // --- Single attempt (with at most one 429-retry) -------------------------
+  let res = await performFetch();
+  let attempts = 1;
+  recordRateLimitHeaders(buckets, res.headers);
+
+  if (res.status === 429) {
+    const waitMs = backoffFor429(res);
+    const retryAfter = Math.max(1, Math.ceil(waitMs / 1000));
+    const bucketHit = buckets[0] ?? null;
+
+    if (waitMs > AGENT_FETCH_MAX_BACKOFF_MS) {
+      console.warn(
+        `[kundeoversikt] ${toolNameForLog}: rate-limit 429 wait=${waitMs}ms ` +
+          `over 60s-cap — returnerer RATE_LIMITED ` +
+          `(event=kundeoversikt_rate_limit_hit source=server attempts=${attempts})`,
+      );
+      if (dryRunLog) {
+        await appendDryRunLog({
+          system: "kundeoversikt",
+          method,
+          path: requestPath,
+          status: 429,
+          rateLimited: true,
+          source: "server",
+          retryAfter,
+          attempts,
+        });
+      }
+      return {
+        kind: "rate_limited",
+        err: {
+          error: "RATE_LIMITED",
+          code: "RATE_LIMITED",
+          retriable: true,
+          hint: RATE_LIMITED_HINT,
+          retryAfter,
+          bucket: bucketHit,
+          attempts,
+          source: "server",
+        },
+      };
+    }
+
+    console.warn(
+      `[kundeoversikt] ${toolNameForLog}: rate-limit 429 backoff ${waitMs}ms før retry ` +
+        `(event=kundeoversikt_rate_limit_hit source=server attempts=${attempts})`,
+    );
+    await vent(waitMs);
+    res = await performFetch();
+    attempts = 2;
+    recordRateLimitHeaders(buckets, res.headers);
+
+    if (res.status === 429) {
+      const retryWaitMs = backoffFor429(res);
+      const retryAfterSecs = Math.max(1, Math.ceil(retryWaitMs / 1000));
+      console.warn(
+        `[kundeoversikt] ${toolNameForLog}: rate-limit 429 også på retry — ` +
+          `returnerer RATE_LIMITED ` +
+          `(event=kundeoversikt_rate_limit_hit source=server attempts=${attempts})`,
+      );
+      if (dryRunLog) {
+        await appendDryRunLog({
+          system: "kundeoversikt",
+          method,
+          path: requestPath,
+          status: 429,
+          rateLimited: true,
+          source: "server",
+          retryAfter: retryAfterSecs,
+          attempts,
+        });
+      }
+      return {
+        kind: "rate_limited",
+        err: {
+          error: "RATE_LIMITED",
+          code: "RATE_LIMITED",
+          retriable: true,
+          hint: RATE_LIMITED_HINT,
+          retryAfter: retryAfterSecs,
+          bucket: bucketHit,
+          attempts,
+          source: "server",
+        },
+      };
+    }
+  }
+
+  return { kind: "response", res, attempts };
+}
+
+/**
+ * Outbound HTTP helper used av Kundeoversikt-tools som ikke trenger
+ * den typede envelope-formen fra `agentBookkeepingFetch`.
+ *
+ * Returnerer:
+ *   - parset JSON-body på 2xx (legacy callers fungerer som før),
+ *   - `{ error: string }` på transport- / non-rate-limit HTTP-feil (legacy),
+ *   - diskriminert `RateLimitedToolError` på 429 (cache eller server).
+ */
+async function agentFetch(
+  path: string,
+  options?: RequestInit,
+): Promise<unknown> {
   const url = `${baseUrl()}${path}`;
   const method = (options?.method ?? "GET").toUpperCase();
   const dryRun = shouldSendDryRunHeader(method);
   const dryRunLog = dryRunEnabled();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
   const jwtCtx = buildJwtContextForCurrentCall();
-  try {
-    const baseHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...((options?.headers as Record<string, string>) ?? {}),
-      ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
-    };
-    let res: Response;
-    if (jwtCtx) {
-      res = await signedFetch(
-        url,
-        {
-          ...options,
-          method,
-          signal: controller.signal,
-          headers: baseHeaders,
-          body: typeof options?.body === "string" ? options.body : undefined,
-        },
-        jwtCtx,
-      );
-    } else {
-      res = await fetch(url, {
+  const buckets = bucketsForCall(path, options?.body);
+  const toolNameForLog = currentToolName ?? "agentFetch";
+
+  const performFetch = async (): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const baseHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        ...((options?.headers as Record<string, string>) ?? {}),
+        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
+      };
+      if (jwtCtx) {
+        return await signedFetch(
+          url,
+          {
+            ...options,
+            method,
+            signal: controller.signal,
+            headers: baseHeaders,
+            body: typeof options?.body === "string" ? options.body : undefined,
+          },
+          jwtCtx,
+        );
+      }
+      return await fetch(url, {
         ...options,
         signal: controller.signal,
         headers: {
@@ -240,7 +455,24 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
           ...baseHeaders,
         },
       });
+    } finally {
+      clearTimeout(timer);
     }
+  };
+
+  let attempts = 0;
+  try {
+    const outcome = await executeFetchWithRateLimit(performFetch, {
+      buckets,
+      toolNameForLog,
+      requestPath: path,
+      method,
+      dryRunLog,
+    });
+    if (outcome.kind === "rate_limited") return outcome.err;
+    const res = outcome.res;
+    attempts = outcome.attempts;
+
     const body = await res.json() as Record<string, unknown>;
     if (dryRunLog) {
       await appendDryRunLog({
@@ -250,6 +482,7 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
         status: res.status,
         ok: res.ok,
         dryRunHeader: dryRun,
+        attempts,
       });
     }
     if (!res.ok) {
@@ -264,11 +497,10 @@ async function agentFetch(path: string, options?: RequestInit): Promise<unknown>
         path,
         error: (err as Error).message,
         dryRunHeader: dryRun,
+        attempts,
       });
     }
     return { error: `Fetch failed: ${(err as Error).message}` };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -429,40 +661,205 @@ async function applyRateLimitBackoff(
   await vent(waitMs);
 }
 
+// ---------------------------------------------------------------------------
+// In-process rate-limit cache used by agentFetch() pre-call gate.
+// Keyed by bucket (agentId-min, agentId-hour, customerId, orgId, runId).
+// Lets us short-circuit before issuing a request the server will only 429.
+// Exported (under __test) for unit tests.
+// ---------------------------------------------------------------------------
+
+type RateLimitCacheEntry = {
+  remaining: number;
+  resetEpoch: number;
+};
+
+const rateLimitCache = new Map<string, RateLimitCacheEntry>();
+
+const AGENT_FETCH_MAX_BACKOFF_MS = 60_000;
+
+export function __resetRateLimitCacheForTest(): void {
+  rateLimitCache.clear();
+}
+
+export function __peekRateLimitCacheForTest(): Map<string, RateLimitCacheEntry> {
+  return new Map(rateLimitCache);
+}
+
+function extractCustomerIdFromPathOrBody(
+  path: string,
+  body: unknown,
+): string | undefined {
+  // Match `/customers/<segment>` and require <segment> to be a strict UUID v1-5.
+  // Loose hex patterns like `/customers/anonymous/...` or `/customers/00000000`
+  // must NOT cache a customer-bucket (Quinn finding #2).
+  const match = /\/customers\/([^/?#]+)/.exec(path);
+  if (match?.[1] && UUID_RE.test(match[1])) return match[1];
+  if (typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body) as unknown;
+      if (
+        isRecord(parsed) &&
+        typeof parsed.customerId === "string" &&
+        UUID_RE.test(parsed.customerId)
+      ) {
+        return parsed.customerId;
+      }
+    } catch {
+      /* not json — ignore */
+    }
+  }
+  return undefined;
+}
+
+function bucketsForCall(path: string, body: unknown): string[] {
+  const buckets: string[] = [];
+  const ctx = currentCallContext;
+  if (ctx) {
+    buckets.push(`agent:${ctx.agentId}:min`);
+    buckets.push(`agent:${ctx.agentId}:hour`);
+    buckets.push(`run:${ctx.runId}`);
+  }
+  const org = process.env.KUNDEOVERSIKT_ORG_ID?.trim();
+  if (org) buckets.push(`org:${org}`);
+  const customerId = extractCustomerIdFromPathOrBody(path, body);
+  if (customerId) buckets.push(`customer:${customerId}`);
+  return buckets;
+}
+
+function getCachedBackoffMs(
+  buckets: string[],
+  nowMs: number,
+): { waitMs: number; bucket: string | null } {
+  let waitMs = 0;
+  let bucket: string | null = null;
+  for (const key of buckets) {
+    const entry = rateLimitCache.get(key);
+    if (!entry) continue;
+    const resetMs = entry.resetEpoch * 1000;
+    if (entry.remaining <= 0 && resetMs > nowMs) {
+      const candidate = resetMs - nowMs;
+      if (candidate > waitMs) {
+        waitMs = candidate;
+        bucket = key;
+      }
+    } else if (resetMs <= nowMs) {
+      // Window har rullet over — fjern utdatert entry.
+      rateLimitCache.delete(key);
+    }
+  }
+  return { waitMs, bucket };
+}
+
+/**
+ * Filter the bucket-set we'll cache rate-limit state into, given the response
+ * headers. Quinn finding #3:
+ *
+ * Vercel/Kundeoversikt returns ONE set of `X-RateLimit-*` headers per response,
+ * which represents the most-restrictive bucket the call hit — but we don't know
+ * which one that was. Recording `remaining=0` against ALL buckets (org, agent,
+ * customer) on every call leads to over-pessimistic blocking of unrelated
+ * customers when the real flaskehals was e.g. the org bucket.
+ *
+ * Strategy:
+ *   - org / agent / run buckets: ALWAYS record. They are shared across all
+ *     customers, so over-pessimism there is safe (and intentional — if one
+ *     call learns the org budget is empty, every other call should respect it).
+ *   - customer:<id> bucket: ONLY record when the server disambiguates with
+ *     `X-RateLimit-Bucket` or `X-RateLimit-Scope` matching the customer scope,
+ *     OR when the path/body is unambiguously customer-scoped AND we have
+ *     positive evidence the headers describe that bucket. Default: skip.
+ */
+function filterBucketsForRecording(
+  buckets: string[],
+  headers: Headers,
+): string[] {
+  const bucketHeader = headers.get("X-RateLimit-Bucket")?.trim().toLowerCase();
+  const scopeHeader = headers.get("X-RateLimit-Scope")?.trim().toLowerCase();
+  const customerScoped =
+    bucketHeader?.startsWith("customer") === true ||
+    scopeHeader === "customer";
+
+  return buckets.filter((key) => {
+    if (key.startsWith("customer:")) {
+      // Only cache customer-bucket if the server explicitly tagged the headers
+      // as customer-scoped. Otherwise we'd block kunde B based on kunde A's call.
+      return customerScoped;
+    }
+    // org / agent / run are global to the org, safe to record from any header.
+    return true;
+  });
+}
+
+function recordRateLimitHeaders(
+  buckets: string[],
+  headers: Headers,
+): void {
+  const state = parseRateLimitHeaders(headers);
+  if (!state) return;
+  const recordable = filterBucketsForRecording(buckets, headers);
+  for (const key of recordable) {
+    rateLimitCache.set(key, {
+      remaining: state.remaining,
+      resetEpoch: state.resetEpoch,
+    });
+  }
+}
+
+type RateLimitedToolError = {
+  error: "RATE_LIMITED";
+  /** Mirror of `error` so callers that check `result.code === "RATE_LIMITED"` work. */
+  code: "RATE_LIMITED";
+  /** Always retriable — it just needs to wait until `retryAfter`. */
+  retriable: true;
+  /** Human-readable instruction for the agent. */
+  hint: string;
+  retryAfter: number; // seconds
+  bucket: string | null;
+  attempts: number;
+  source: "cache" | "server";
+};
+
+const RATE_LIMITED_HINT =
+  "Rate-limit truffet — vent retryAfter sekunder før neste kall.";
+
 async function agentBookkeepingFetch(
   requestPath: string,
   options?: RequestInit,
-): Promise<KundeoversiktHttpResponse | ToolError> {
+): Promise<KundeoversiktHttpResponse | ToolError | RateLimitedToolError> {
   const url = `${baseUrl()}${requestPath}`;
   const method = (options?.method ?? "GET").toUpperCase();
   const dryRun = shouldSendDryRunHeader(method);
   const dryRunLog = dryRunEnabled();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
   const jwtCtx = buildJwtContextForCurrentCall();
+  const buckets = bucketsForCall(requestPath, options?.body);
+  const toolNameForLog = currentToolName ?? "agentBookkeepingFetch";
 
-  try {
-    const baseHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
-      "X-Paperclip-Contract-Version": "1",
-      ...((options?.headers as Record<string, string>) ?? {}),
-      ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
-    };
-    let res: Response;
-    if (jwtCtx) {
-      res = await signedFetch(
-        url,
-        {
-          ...options,
-          method,
-          signal: controller.signal,
-          headers: baseHeaders,
-          body: typeof options?.body === "string" ? options.body : undefined,
-        },
-        jwtCtx,
-      );
-    } else {
-      res = await fetch(url, {
+  // Each fetch attempt gets its own controller so the retry path doesn't
+  // inherit an aborted signal from the first try.
+  const performFetch = async (): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const baseHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        "X-Paperclip-Contract-Version": "1",
+        ...((options?.headers as Record<string, string>) ?? {}),
+        ...(dryRun ? { "X-Paperclip-Dry-Run": "true" } : {}),
+      };
+      if (jwtCtx) {
+        return await signedFetch(
+          url,
+          {
+            ...options,
+            method,
+            signal: controller.signal,
+            headers: baseHeaders,
+            body: typeof options?.body === "string" ? options.body : undefined,
+          },
+          jwtCtx,
+        );
+      }
+      return await fetch(url, {
         ...options,
         signal: controller.signal,
         headers: {
@@ -470,7 +867,23 @@ async function agentBookkeepingFetch(
           ...baseHeaders,
         },
       });
+    } finally {
+      clearTimeout(timer);
     }
+  };
+
+  try {
+    // Quinn finding #1: route bookkeeping calls through the same rate-limit
+    // executor as agentFetch so cache-gate + 429-retry apply uniformly.
+    const outcome = await executeFetchWithRateLimit(performFetch, {
+      buckets,
+      toolNameForLog,
+      requestPath,
+      method,
+      dryRunLog,
+    });
+    if (outcome.kind === "rate_limited") return outcome.err;
+    const res = outcome.res;
 
     const rawText = await res.text();
     let body: unknown = null;
@@ -491,6 +904,7 @@ async function agentBookkeepingFetch(
         ok: res.ok,
         dryRunHeader: dryRun,
         contractVersion: "1",
+        attempts: outcome.attempts,
       });
     }
 
@@ -515,8 +929,6 @@ async function agentBookkeepingFetch(
       error: `Fetch failed: ${(err as Error).message}`,
       code: "FETCH_FAILED",
     };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -817,6 +1229,120 @@ export const KUNDEOVERSIKT_TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ["contentMarkdown", "highlightsJson"],
+      additionalProperties: false,
+    },
+  },
+
+  // === 15. Upsert knowledge-note draft (krav-engine for læringsloop) ===
+  {
+    name: "kundeoversikt_upsert_knowledge_note_draft",
+    description:
+      "Lag eller oppdater et utkast til en kunnskapsnote for en kunde. " +
+      "Brukes når agenten oppdager mønster (regnskapsregel, kundeunntak, " +
+      "leverandør-mapping, MVA-regel, tone-preferanse, stop-regel, " +
+      "compliance-regel) og trenger å lagre det. " +
+      "ALLE drafts venter på Tores godkjenning før de tas i bruk. " +
+      "Sett basedOnRevisionId hvis du bygger videre på et eksisterende utkast " +
+      "(unngår STALE_DRAFT 409). Organisasjonen hentes fra env, " +
+      "så IKKE send organizationId.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        customerId: {
+          type: "string",
+          description: "UUID for kunden noten gjelder. Må tilhøre vår organisasjon.",
+        },
+        customerSlug: {
+          type: "string",
+          description: "Kunde-slug (1-120 tegn).",
+          minLength: 1,
+          maxLength: 120,
+        },
+        noteKey: {
+          type: "string",
+          description:
+            "Stabil nøkkel for noten (1-200 tegn). Unik per (org, customer). " +
+            "Brukes til upsert-logikken.",
+          minLength: 1,
+          maxLength: 200,
+        },
+        noteType: {
+          type: "string",
+          enum: [...KNOWLEDGE_NOTE_TYPES],
+          description: "Notetype.",
+        },
+        title: {
+          type: "string",
+          description: "Tittel (1-200 tegn).",
+          minLength: 1,
+          maxLength: 200,
+        },
+        contentMd: {
+          type: "string",
+          description: "Markdown-innhold for noten (minst 1 tegn).",
+          minLength: 1,
+        },
+        content: {
+          type: "object",
+          description: "Strukturert innhold for noten.",
+          properties: {
+            scope: { type: "string", enum: ["customer"], description: "Må være 'customer'." },
+            trigger: { type: "string", description: "Når regelen utløses." },
+            action: { type: "string", description: "Hva som skal skje." },
+            source: { type: "string", description: "Hvor regelen kommer fra (f.eks. 'feedback fra Tore')." },
+            example: { type: "string", description: "Valgfritt eksempel." },
+          },
+          required: ["scope", "trigger", "action", "source"],
+        },
+        rationale: {
+          type: "string",
+          description: "Hvorfor utkastet er riktig (1-4000 tegn).",
+          minLength: 1,
+          maxLength: 4000,
+        },
+        confidence: {
+          type: "number",
+          description: "Konfidens 0-1.",
+          minimum: 0,
+          maximum: 1,
+        },
+        idempotencyKey: {
+          type: "string",
+          description:
+            "Valgfri. Hvis utelatt, bygges deterministisk fra " +
+            "sha256(runId:customerId:noteKey).slice(0,32).",
+          minLength: 1,
+          maxLength: 200,
+        },
+        basedOnRevisionId: {
+          type: "string",
+          description: "UUID for forrige revisjon (anbefales for STALE_DRAFT-unngåelse).",
+        },
+        modelVersion: { type: "string", description: "Modellversjon (sporing)." },
+        promptVersion: { type: "string", description: "Promptversjon (sporing)." },
+        sourceRefs: {
+          type: "array",
+          items: { type: "string" },
+          description: "Referanser (URL/ID-er).",
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Tags for kategorisering.",
+        },
+        traceId: { type: "string", description: "Sporings-ID for distribuert tracing." },
+      },
+      required: [
+        "customerId",
+        "customerSlug",
+        "noteKey",
+        "noteType",
+        "title",
+        "contentMd",
+        "content",
+        "rationale",
+        "confidence",
+      ],
       additionalProperties: false,
     },
   },
@@ -1617,6 +2143,315 @@ async function runKundeoversiktTool(
           generatedAtUtc: new Date().toISOString(),
         }),
       });
+    }
+
+    case "kundeoversikt_upsert_knowledge_note_draft": {
+      // --- Required string fields with manual validation (consistent with
+      // existing tools — pakken har ikke zod som dependency) ---
+      const customerId = readStringArg(args, "customerId", "customer_id");
+      if (!customerId) return invalidArguments("customerId er påkrevd.");
+      if (!isUuid(customerId)) {
+        return invalidArguments("customerId må være en gyldig UUID.");
+      }
+
+      const customerSlug = readStringArg(args, "customerSlug", "customer_slug");
+      if (!customerSlug) return invalidArguments("customerSlug er påkrevd.");
+      if (customerSlug.length > 120) {
+        return invalidArguments("customerSlug må være maks 120 tegn.");
+      }
+
+      const noteKey = readStringArg(args, "noteKey", "note_key");
+      if (!noteKey) return invalidArguments("noteKey er påkrevd.");
+      if (noteKey.length > 200) {
+        return invalidArguments("noteKey må være maks 200 tegn.");
+      }
+
+      const noteType = readStringArg(args, "noteType", "note_type");
+      if (!noteType) return invalidArguments("noteType er påkrevd.");
+      if (!(KNOWLEDGE_NOTE_TYPES as readonly string[]).includes(noteType)) {
+        return invalidArguments(
+          `noteType må være en av: ${KNOWLEDGE_NOTE_TYPES.join(", ")}.`,
+        );
+      }
+
+      const title = readStringArg(args, "title");
+      if (!title) return invalidArguments("title er påkrevd.");
+      if (title.length > 200) {
+        return invalidArguments("title må være maks 200 tegn.");
+      }
+
+      const contentMd = readStringArg(args, "contentMd", "content_md");
+      if (!contentMd) return invalidArguments("contentMd er påkrevd.");
+
+      const contentObj = ensureObjectPayload(args.content);
+      if (!contentObj) {
+        return invalidArguments("content må være et objekt.");
+      }
+      const scope = contentObj.scope;
+      const trigger = contentObj.trigger;
+      const action = contentObj.action;
+      const source = contentObj.source;
+      if (scope !== "customer") {
+        return invalidArguments("content.scope må være 'customer'.");
+      }
+      if (typeof trigger !== "string" || trigger.trim().length === 0) {
+        return invalidArguments("content.trigger er påkrevd.");
+      }
+      if (typeof action !== "string" || action.trim().length === 0) {
+        return invalidArguments("content.action er påkrevd.");
+      }
+      if (typeof source !== "string" || source.trim().length === 0) {
+        return invalidArguments("content.source er påkrevd.");
+      }
+
+      const rationale = readStringArg(args, "rationale");
+      if (!rationale) return invalidArguments("rationale er påkrevd.");
+      if (rationale.length > 4000) {
+        return invalidArguments("rationale må være maks 4000 tegn.");
+      }
+
+      const confidence = readNumberArg(args, "confidence");
+      if (confidence === undefined) {
+        return invalidArguments("confidence er påkrevd.");
+      }
+      if (confidence < 0 || confidence > 1) {
+        return invalidArguments("confidence må være mellom 0 og 1.");
+      }
+
+      // --- Deterministic idempotency key (caller may override) ---
+      // Hvis caller ikke har gitt en, bygg fra runId + customerId + noteKey.
+      // Vi trenger runId fra currentCallContext for å gjøre dette deterministisk
+      // på tvers av retries innen samme run.
+      const callerIdempotencyKey = readStringArg(
+        args,
+        "idempotencyKey",
+        "idempotency_key",
+      );
+      let idempotencyKey: string;
+      if (callerIdempotencyKey) {
+        if (callerIdempotencyKey.length > 200) {
+          return invalidArguments("idempotencyKey må være maks 200 tegn.");
+        }
+        idempotencyKey = callerIdempotencyKey;
+      } else {
+        const runIdForKey = currentCallContext?.runId ?? "no-run-id";
+        idempotencyKey = computeKnowledgeNoteDraftIdempotencyKey(
+          runIdForKey,
+          customerId,
+          noteKey,
+        );
+      }
+
+      // --- organizationId injiseres ALLTID fra env, aldri fra args ---
+      const organizationId = orgId();
+
+      // --- Optional fields ---
+      const basedOnRevisionId = readStringArg(
+        args,
+        "basedOnRevisionId",
+        "based_on_revision_id",
+      );
+      const modelVersion = readStringArg(args, "modelVersion", "model_version");
+      const promptVersion = readStringArg(args, "promptVersion", "prompt_version");
+      const traceId = readStringArg(args, "traceId", "trace_id");
+      const sourceRefs = Array.isArray(args.sourceRefs)
+        ? (args.sourceRefs as unknown[]).filter(
+            (x): x is string => typeof x === "string",
+          )
+        : Array.isArray(args.source_refs)
+          ? (args.source_refs as unknown[]).filter(
+              (x): x is string => typeof x === "string",
+            )
+          : undefined;
+      const tags = Array.isArray(args.tags)
+        ? (args.tags as unknown[]).filter(
+            (x): x is string => typeof x === "string",
+          )
+        : undefined;
+
+      // --- Build request body ---
+      const requestBody: JsonObject = {
+        organizationId,
+        customerId,
+        customerSlug,
+        noteKey,
+        noteType,
+        title,
+        contentMd,
+        content: {
+          scope,
+          trigger,
+          action,
+          source,
+          ...(typeof contentObj.example === "string"
+            ? { example: contentObj.example }
+            : {}),
+        },
+        rationale,
+        confidence,
+        idempotencyKey,
+      };
+      if (basedOnRevisionId) requestBody.basedOnRevisionId = basedOnRevisionId;
+      if (modelVersion) requestBody.modelVersion = modelVersion;
+      if (promptVersion) requestBody.promptVersion = promptVersion;
+      if (sourceRefs && sourceRefs.length > 0) requestBody.sourceRefs = sourceRefs;
+      if (tags && tags.length > 0) requestBody.tags = tags;
+      if (traceId) requestBody.traceId = traceId;
+
+      const response = await agentBookkeepingFetch(
+        "/upsert-knowledge-note-draft",
+        {
+          method: "POST",
+          body: JSON.stringify(requestBody),
+        },
+      );
+      if ("error" in response) return response;
+
+      warnOnUnexpectedContractVersion(toolName, response.headers);
+
+      const syntheticResponse = new Response(null, {
+        status: response.status,
+        headers: response.headers,
+      });
+      await applyRateLimitBackoff(toolName, syntheticResponse);
+
+      // --- Error mapping per spec ---
+      const status = response.status;
+      const body = response.body;
+      const code = isRecord(body) && typeof body.code === "string" ? body.code : undefined;
+      const errMsg =
+        isRecord(body) && typeof body.error === "string"
+          ? body.error
+          : `Knowledge-note draft feilet (HTTP ${status})`;
+
+      const buildErr = (
+        retriable: boolean,
+        hint: string,
+        retryAfter?: number,
+      ): JsonObject => {
+        const out: JsonObject = {
+          error: errMsg,
+          code: code ?? `HTTP_${status}`,
+          retriable,
+          hint,
+        };
+        if (retryAfter !== undefined) out.retryAfter = retryAfter;
+        return out;
+      };
+
+      const parseRetryAfter = (): number | undefined => {
+        const ra = response.headers.get("Retry-After");
+        if (!ra) return undefined;
+        const n = Number(ra);
+        return Number.isFinite(n) && n >= 0 ? n : undefined;
+      };
+
+      if (status === 401) {
+        if (code === "JWT_EXPIRED" || code === "JWT_FUTURE") {
+          return buildErr(true, "JWT-klokke utenfor vindu — re-sign og prøv igjen.");
+        }
+        if (code === "JWT_REPLAY") {
+          return buildErr(false, "JWT-jti er allerede brukt; ikke retry.");
+        }
+        if (code === "JWT_TOOL_MISMATCH") {
+          return buildErr(false, "JWT.tool matcher ikke endepunktet; sjekk signedFetch-kontekst.");
+        }
+        if (code === "JWT_MISSING") {
+          return buildErr(false, "JWT-header manglet; sjekk PAPERCLIP_AGENT_JWT_ENABLED.");
+        }
+        return buildErr(false, "Uventet 401 fra Kundeoversikt.");
+      }
+      if (status === 400) {
+        if (code === "JWT_BODY_MISMATCH") {
+          return buildErr(false, "body_sha256 matcher ikke wire-body — caller serialiserte feil.");
+        }
+        if (code === "INVALID_BODY") {
+          return buildErr(false, "Body validation failed på server-side; ikke retry uten endringer.");
+        }
+        return buildErr(false, "Bad request fra Kundeoversikt.");
+      }
+      if (status === 403) {
+        if (code === "JWT_ORG_MISMATCH") {
+          return buildErr(false, "JWT.organization_id matcher ikke target — sjekk env.");
+        }
+        return buildErr(false, "Forbidden — kunden tilhører ikke vår org eller mangler tilgang.");
+      }
+      if (status === 409) {
+        if (code === "STALE_DRAFT") {
+          return buildErr(true, "Hent ny basedOnRevisionId og prøv igjen.");
+        }
+        if (code === "IDEMPOTENCY_CONFLICT") {
+          return buildErr(false, "Samme idempotencyKey + ulik body. Generer ny key.");
+        }
+        if (code === "DRAFT_QUEUE_FULL") {
+          return buildErr(true, "Draft-køen er full; vent og prøv igjen.", 60);
+        }
+        return buildErr(false, "Conflict fra Kundeoversikt.");
+      }
+      if (status === 429) {
+        return buildErr(true, "Rate-limited; respekter Retry-After.", parseRetryAfter() ?? 60);
+      }
+      if (status === 503) {
+        if (code === "DRAFT_INTAKE_PAUSED") {
+          return buildErr(true, "Draft-intake er midlertidig pauset av Kundeoversikt.");
+        }
+        return buildErr(true, "Service unavailable.");
+      }
+      if (status === 500) {
+        return buildErr(true, "Server-feil hos Kundeoversikt.");
+      }
+
+      if (status !== 200) {
+        return normalizeErrorResponse(
+          body,
+          `Uventet svar fra upsert-knowledge-note-draft (HTTP ${status})`,
+        );
+      }
+
+      if (!isRecord(body)) {
+        return normalizeErrorResponse(
+          null,
+          "Kunne ikke tolke svar fra upsert-knowledge-note-draft.",
+          "INVALID_RESPONSE",
+        );
+      }
+
+      // --- Happy path. embeddingStatus=pending_retry er IKKE feil.
+      // Quinn finding #5: whitelist embeddingStatus. 'failed' or unknown
+      // values must surface as a structured error so the agent doesn't
+      // silently treat a noteId=null response as success. ---
+      const result = body as KnowledgeNoteDraftResponse;
+      const rawEmbedding = result.embeddingStatus;
+      const allowedEmbeddingStatuses = new Set(["ok", "pending_retry"]);
+      if (
+        typeof rawEmbedding !== "string" ||
+        !allowedEmbeddingStatuses.has(rawEmbedding)
+      ) {
+        const observed =
+          typeof rawEmbedding === "string" ? rawEmbedding : "unknown";
+        return {
+          error: `Embedding feilet — Kundeoversikt vil retry. (observed=${observed})`,
+          code: "EMBEDDING_FAILED",
+          retriable: true,
+          hint: "Embedding feilet — Kundeoversikt vil retry.",
+          embeddingStatus: observed,
+        };
+      }
+      const out: JsonObject = {
+        status: result.status,
+        noteId: result.noteId,
+        revisionId: result.revisionId,
+        queueId: result.queueId,
+        basedOnRevisionId: result.basedOnRevisionId,
+        diffPreview: result.diffPreview,
+        embeddingStatus: rawEmbedding,
+        requiresToreReview: result.requiresToreReview,
+      };
+      if (rawEmbedding === "pending_retry") {
+        out._note =
+          "Embedding pending — Kundeoversikt vil retry. Noten er lagret som draft.";
+      }
+      return out;
     }
 
     default:
