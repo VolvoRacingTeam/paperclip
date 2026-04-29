@@ -63,80 +63,6 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function readTimeoutStream(error: TimeoutError, key: "stdout" | "stderr"): string {
-  const direct = (error as unknown as Record<string, unknown>)[key];
-  if (typeof direct === "string" && direct.length > 0) return direct;
-  const nested = (error as { result?: Record<string, unknown> }).result?.[key];
-  if (typeof nested === "string") return nested;
-  return typeof direct === "string" ? direct : "";
-}
-
-function buildTimeoutExecuteResult(error: TimeoutError): PluginEnvironmentExecuteResult {
-  const stdout = readTimeoutStream(error, "stdout");
-  const stderrOutput = readTimeoutStream(error, "stderr");
-  const message = error.message.trim();
-  const stderr = stderrOutput.length > 0
-    ? message.length > 0 && !stderrOutput.includes(message)
-      ? `${stderrOutput}${stderrOutput.endsWith("\n") ? "" : "\n"}${message}\n`
-      : stderrOutput
-    : message.length > 0
-      ? `${message}\n`
-      : "";
-  return {
-    exitCode: null,
-    timedOut: true,
-    stdout,
-    stderr,
-  };
-}
-
-async function waitForBackgroundCommand(
-  sandbox: Sandbox,
-  command: string,
-  options: {
-    cwd?: string;
-    envs?: Record<string, string>;
-    timeoutMs?: number;
-  },
-): Promise<PluginEnvironmentExecuteResult> {
-  // Use E2B background handles so long-running agent commands do not monopolize
-  // the foreground command slot needed by the sandbox callback bridge worker.
-  const handle = await sandbox.commands.run(command, {
-    ...options,
-    background: true,
-  }) as Awaited<ReturnType<Sandbox["commands"]["run"]>> & {
-    wait(): Promise<{
-      exitCode: number;
-      stdout: string;
-      stderr: string;
-    }>;
-  };
-
-  try {
-    const result = await handle.wait();
-    return {
-      exitCode: result.exitCode,
-      timedOut: false,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    };
-  } catch (error) {
-    if (error instanceof CommandExitError) {
-      const commandError = error as CommandExitError;
-      return {
-        exitCode: commandError.exitCode,
-        timedOut: false,
-        stdout: commandError.stdout,
-        stderr: commandError.stderr,
-      };
-    }
-    if (error instanceof TimeoutError) {
-      return buildTimeoutExecuteResult(error);
-    }
-    throw error;
-  }
-}
-
 async function ensureSandboxWorkspace(sandbox: Sandbox, remoteCwd: string): Promise<void> {
   await sandbox.commands.run(`mkdir -p ${shellQuote(remoteCwd)}`);
 }
@@ -189,10 +115,6 @@ function shellQuote(value: string) {
 
 function buildCommandLine(command: string, args: string[] = []) {
   return `exec ${[command, ...args].map(shellQuote).join(" ")}`;
-}
-
-function buildSandboxStdinPath() {
-  return path.posix.join("/tmp", `paperclip-stdin-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
 }
 
 async function killSandboxBestEffort(sandbox: Sandbox, reason: string): Promise<void> {
@@ -395,25 +317,56 @@ const plugin = definePlugin({
     const config = parseDriverConfig(params.config);
     const sandbox = await connectSandbox(config, params.lease.providerLeaseId);
     const command = buildCommandLine(params.command, params.args);
-    if (params.stdin == null) {
-      return await waitForBackgroundCommand(sandbox, command, {
-        cwd: params.cwd,
-        envs: params.env,
-        timeoutMs: params.timeoutMs ?? config.timeoutMs,
-      });
-    }
+    const timeoutMs = params.timeoutMs ?? config.timeoutMs;
 
-    const stdinPath = buildSandboxStdinPath();
+    const started = await sandbox.commands.run(command, {
+      background: true,
+      stdin: params.stdin != null,
+      cwd: params.cwd,
+      envs: params.env,
+      timeoutMs,
+    }) as Awaited<ReturnType<Sandbox["commands"]["run"]>> & {
+      pid: number;
+      stdout: string;
+      stderr: string;
+      wait(): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+    };
 
     try {
-      await sandbox.files.write(stdinPath, params.stdin);
-      return await waitForBackgroundCommand(sandbox, `${command} < ${shellQuote(stdinPath)}`, {
-        cwd: params.cwd,
-        envs: params.env,
-        timeoutMs: params.timeoutMs ?? config.timeoutMs,
-      });
-    } finally {
-      await sandbox.files.remove(stdinPath).catch(() => undefined);
+      if (params.stdin != null) {
+        try {
+          await sandbox.commands.sendStdin(started.pid, params.stdin);
+        } finally {
+          await sandbox.commands.closeStdin(started.pid);
+        }
+      }
+      const result = await started.wait();
+      return {
+        exitCode: result.exitCode,
+        timedOut: false,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    } catch (error) {
+      if (error instanceof CommandExitError) {
+        const commandError = error as CommandExitError;
+        return {
+          exitCode: commandError.exitCode,
+          timedOut: false,
+          stdout: commandError.stdout,
+          stderr: commandError.stderr,
+        };
+      }
+      if (error instanceof TimeoutError) {
+        const timeoutError = error as TimeoutError;
+        return {
+          exitCode: null,
+          timedOut: true,
+          stdout: started.stdout,
+          stderr: started.stderr || `${timeoutError.message}\n`,
+        };
+      }
+      throw error;
     }
   },
 });
