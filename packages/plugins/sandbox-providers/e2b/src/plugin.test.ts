@@ -282,19 +282,18 @@ describe("E2B sandbox provider plugin", () => {
     });
 
     expect(mockConnect).toHaveBeenCalledWith("sandbox-123", expect.objectContaining({ apiKey: "resolved-key" }));
-    expect(sandbox.files.write).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-stdin-/), "input");
-    expect(sandbox.commands.run).toHaveBeenCalledWith(expect.stringMatching(
-      /^exec 'printf' 'hello' < '\/tmp\/paperclip-stdin-/,
-    ), expect.objectContaining({
-      background: true,
-      cwd: "/workspace",
-      envs: { FOO: "bar" },
-      timeoutMs: 1000,
-    }));
-    expect(sandbox.handle.wait).toHaveBeenCalledTimes(1);
-    expect(sandbox.commands.sendStdin).not.toHaveBeenCalled();
-    expect(sandbox.commands.closeStdin).not.toHaveBeenCalled();
-    expect(sandbox.files.remove).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-stdin-/));
+    expect(sandbox.commands.run).toHaveBeenCalledWith(
+      "exec 'printf' 'hello'",
+      expect.objectContaining({
+        background: true,
+        stdin: true,
+        cwd: "/workspace",
+        envs: { FOO: "bar" },
+        timeoutMs: 1000,
+      }),
+    );
+    expect(sandbox.commands.sendStdin).toHaveBeenCalledWith(sandbox.handle.pid, "input");
+    expect(sandbox.commands.closeStdin).toHaveBeenCalledWith(sandbox.handle.pid);
     expect(result).toEqual({
       exitCode: 0,
       timedOut: false,
@@ -357,10 +356,10 @@ describe("E2B sandbox provider plugin", () => {
     });
   });
 
-  it("cleans up staged stdin even when writing it fails", async () => {
+  it("propagates sendStdin errors for stdin commands", async () => {
     const sandbox = createMockSandbox();
-    const failure = new Error("write failed");
-    sandbox.files.write.mockRejectedValueOnce(failure);
+    const failure = new Error("sendStdin failed");
+    sandbox.commands.sendStdin.mockRejectedValueOnce(failure);
     mockConnect.mockResolvedValue(sandbox);
 
     await expect(plugin.definition.onEnvironmentExecute?.({
@@ -380,11 +379,9 @@ describe("E2B sandbox provider plugin", () => {
       env: { FOO: "bar" },
       stdin: "input",
       timeoutMs: 1000,
-    })).rejects.toThrow("write failed");
+    })).rejects.toThrow("sendStdin failed");
 
-    expect(sandbox.files.remove).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-stdin-/));
-    expect(sandbox.commands.sendStdin).not.toHaveBeenCalled();
-    expect(sandbox.handle.wait).not.toHaveBeenCalled();
+    expect(sandbox.commands.closeStdin).toHaveBeenCalledWith(sandbox.handle.pid);
   });
 
   it("preserves partial foreground output when a non-stdin command times out", async () => {
