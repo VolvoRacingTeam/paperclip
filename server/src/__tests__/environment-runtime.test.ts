@@ -551,7 +551,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(executed.stdout).toBe("ok\n");
     expect(released).toHaveLength(1);
     expect(released[0]?.lease.status).toBe("released");
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 1000);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 31000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything());
   });
 
