@@ -1,0 +1,39 @@
+{
+  "_doc": "Paperclip-side mirror of Fikenverktøy/fixtures/paperclip/fiken-invoice-draft-upsert-smoke.json (Codex commit 5cb335f). The contract-test asserts our wrapper round-trips the planHash baseline. If Codex updates the canonical fixture, sync this file and the planHash baseline.",
+  "_authoritativeSource": "https://github.com/<fikenverktoy-org>/fikenverktoy/blob/master/fixtures/paperclip/fiken-invoice-draft-upsert-smoke.json",
+  "_planHashBaseline": "7eed046114bf16ee438f50abd5134e673573c479520a0c79beaf44b5afc08763",
+  "request": {
+    "tool": "fiken.invoice_drafts.upsert_with_lines",
+    "arguments": {
+      "company_slug": "fiken-demo-total-blomst-as",
+      "external_ref": "ko-billing-1-2026Q1",
+      "contact_id": 9876543210,
+      "issue_date": "2026-04-28",
+      "due_date": "2026-05-28",
+      "lines": [
+        {
+          "account": "3000",
+          "amount_ore": 100000,
+          "description": "Konsulenttjeneste Q1 2026",
+          "vat_type": "HIGH"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": "success",
+    "data": {
+      "draft_id": 12345,
+      "external_ref": "ko-billing-1-2026Q1",
+      "fiken_response_status": 201
+    },
+    "audit": {
+      "correlation_id": "01HXYZ0000000000000000CORR",
+      "request_id": "fkv-req-2026-04-28-0001",
+      "plan_hash": "7eed046114bf16ee438f50abd5134e673573c479520a0c79beaf44b5afc08763",
+      "capability_id": "fiken.invoice_drafts.upsert_with_lines",
+      "capability_kind": "write",
+      "compensation_status": "not_required"
+    }
+  }
+}
