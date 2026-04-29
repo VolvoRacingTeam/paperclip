@@ -36,6 +36,7 @@ import {
   executePluginEnvironmentCommand,
   realizePluginEnvironmentWorkspace,
   resolvePluginSandboxProviderDriverByKey,
+  resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
@@ -645,20 +646,6 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function resolvePluginExecuteRpcTimeoutMs(input: {
-  requestedTimeoutMs?: number;
-  config: Record<string, unknown>;
-}): number | undefined {
-  if (Number.isFinite(input.requestedTimeoutMs) && (input.requestedTimeoutMs ?? 0) > 0) {
-    return Math.trunc(input.requestedTimeoutMs!);
-  }
-  const configTimeoutMs = typeof input.config.timeoutMs === "number" ? input.config.timeoutMs : null;
-  if (configTimeoutMs && Number.isFinite(configTimeoutMs) && configTimeoutMs > 0) {
-    return Math.trunc(configTimeoutMs);
-  }
-  return undefined;
 }
 
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([

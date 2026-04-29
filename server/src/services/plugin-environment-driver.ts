@@ -317,23 +317,27 @@ export async function executePluginEnvironmentCommand(input: {
     plugin.id,
     "environmentExecute",
     input.params,
-    resolvePluginEnvironmentExecuteRpcTimeoutMs({
+    resolvePluginExecuteRpcTimeoutMs({
       requestedTimeoutMs: input.params.timeoutMs,
-      driverConfig: input.config.driverConfig,
+      config: input.config.driverConfig,
     }),
   );
 }
 
-function resolvePluginEnvironmentExecuteRpcTimeoutMs(input: {
+const RPC_OVERHEAD_BUFFER_MS = 30_000;
+
+export function resolvePluginExecuteRpcTimeoutMs(input: {
   requestedTimeoutMs?: number;
-  driverConfig: Record<string, unknown>;
+  config: Record<string, unknown>;
 }): number | undefined {
+  let baseMs: number | undefined;
   if (Number.isFinite(input.requestedTimeoutMs) && (input.requestedTimeoutMs ?? 0) > 0) {
-    return Math.trunc(input.requestedTimeoutMs!);
+    baseMs = Math.trunc(input.requestedTimeoutMs!);
+  } else {
+    const configTimeoutMs = typeof input.config.timeoutMs === "number" ? input.config.timeoutMs : null;
+    if (configTimeoutMs && Number.isFinite(configTimeoutMs) && configTimeoutMs > 0) {
+      baseMs = Math.trunc(configTimeoutMs);
+    }
   }
-  const configTimeoutMs = input.driverConfig.timeoutMs;
-  if (typeof configTimeoutMs === "number" && Number.isFinite(configTimeoutMs) && configTimeoutMs > 0) {
-    return Math.trunc(configTimeoutMs);
-  }
-  return undefined;
+  return baseMs != null ? baseMs + RPC_OVERHEAD_BUFFER_MS : undefined;
 }

@@ -191,7 +191,7 @@ function buildCommandLine(command: string, args: string[] = []) {
   return `exec ${[command, ...args].map(shellQuote).join(" ")}`;
 }
 
-function buildForegroundStdinPath() {
+function buildSandboxStdinPath() {
   return path.posix.join("/tmp", `paperclip-stdin-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
 }
 
@@ -403,7 +403,7 @@ const plugin = definePlugin({
       });
     }
 
-    const stdinPath = buildForegroundStdinPath();
+    const stdinPath = buildSandboxStdinPath();
 
     try {
       await sandbox.files.write(stdinPath, params.stdin);
