@@ -691,7 +691,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: expect.objectContaining({
         apiKey: "resolved-provider-key",
       }),
-    }), 1234);
+    }), 31234);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
       config: expect.objectContaining({
         apiKey: "resolved-provider-key",
@@ -1148,7 +1148,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       args: ["ok"],
       cwd: "/workspace/project",
       env: { FOO: "bar" },
-    }), 1000);
+    }), 31000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",
       companyId,
