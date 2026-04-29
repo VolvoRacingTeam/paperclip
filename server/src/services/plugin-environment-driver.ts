@@ -313,5 +313,27 @@ export async function executePluginEnvironmentCommand(input: {
         workerManager: input.workerManager,
         config: input.config,
       });
-  return await input.workerManager.call(plugin.id, "environmentExecute", input.params);
+  return await input.workerManager.call(
+    plugin.id,
+    "environmentExecute",
+    input.params,
+    resolvePluginEnvironmentExecuteRpcTimeoutMs({
+      requestedTimeoutMs: input.params.timeoutMs,
+      driverConfig: input.config.driverConfig,
+    }),
+  );
+}
+
+function resolvePluginEnvironmentExecuteRpcTimeoutMs(input: {
+  requestedTimeoutMs?: number;
+  driverConfig: Record<string, unknown>;
+}): number | undefined {
+  if (Number.isFinite(input.requestedTimeoutMs) && (input.requestedTimeoutMs ?? 0) > 0) {
+    return Math.trunc(input.requestedTimeoutMs!);
+  }
+  const configTimeoutMs = input.driverConfig.timeoutMs;
+  if (typeof configTimeoutMs === "number" && Number.isFinite(configTimeoutMs) && configTimeoutMs > 0) {
+    return Math.trunc(configTimeoutMs);
+  }
+  return undefined;
 }

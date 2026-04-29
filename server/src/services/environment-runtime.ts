@@ -565,11 +565,12 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
+          const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
           return await pluginWorkerManager.call(pluginId, "environmentExecute", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
-            config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+            config: sanitizedConfig,
             lease: {
               providerLeaseId: input.lease.providerLeaseId,
               metadata: input.lease.metadata ?? undefined,
@@ -581,7 +582,10 @@ function createSandboxEnvironmentDriver(
             env: input.env,
             stdin: input.stdin,
             timeoutMs: input.timeoutMs,
-          });
+          }, resolvePluginExecuteRpcTimeoutMs({
+            requestedTimeoutMs: input.timeoutMs,
+            config: sanitizedConfig,
+          }));
         }
       }
       throw new Error("Sandbox driver does not support direct command execution for built-in providers.");
@@ -641,6 +645,20 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function resolvePluginExecuteRpcTimeoutMs(input: {
+  requestedTimeoutMs?: number;
+  config: Record<string, unknown>;
+}): number | undefined {
+  if (Number.isFinite(input.requestedTimeoutMs) && (input.requestedTimeoutMs ?? 0) > 0) {
+    return Math.trunc(input.requestedTimeoutMs!);
+  }
+  const configTimeoutMs = typeof input.config.timeoutMs === "number" ? input.config.timeoutMs : null;
+  if (configTimeoutMs && Number.isFinite(configTimeoutMs) && configTimeoutMs > 0) {
+    return Math.trunc(configTimeoutMs);
+  }
+  return undefined;
 }
 
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
