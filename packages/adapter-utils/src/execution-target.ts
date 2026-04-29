@@ -694,6 +694,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
           method,
           headers,
           ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
+          signal: AbortSignal.timeout(30_000),
         });
         return {
           status: response.status,
