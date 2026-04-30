@@ -10,13 +10,16 @@
  *   - PAPERCLIP_JWT_PRIVATE_KEY_PEM         (ES256 PEM, inline) OR
  *     PAPERCLIP_JWT_PRIVATE_KEY_PATH        (ES256 PEM, on-disk path)
  *
+ * Store-driver:
+ *   Default: InMemoryAgentRunStateStore — process-lokal, taler restart kun
+ *   for read-only paths (M2.2). Server-laget kan registrere en DB-backed
+ *   store via registerProductionAgentRunStateStore() ved oppstart, basert paa
+ *   PAPERCLIP_RUNTIME_STATE_DRIVER env-var. Kreves for M2.4 destructive writes
+ *   sa correlation-context overlever container-restart.
+ *
  * Open questions (spec §6) deliberately NOT resolved here:
  *   Q3 — token-exchange model (raw PAT vs JWT-bound). FikenAccessTokenFetcher
  *        is forward-compatible: caller only sees an opaque string.
- *   Q4 — agent_runtime_state location. Today we use the InMemoryAgentRunStateStore
- *        from M2.1 — it survives within one worker process, which is good enough
- *        for read-only swap (no idempotency-conflict risk on reads). DB-backed
- *        impl is a follow-up before destructive writes go live (M2.4+).
  */
 
 import {
@@ -24,8 +27,10 @@ import {
   FikenMcpClient,
   InMemoryAgentRunStateStore,
 } from "./fiken-mcp/index.js";
+import type { AgentRunStateStore } from "./fiken-mcp/index.js";
 
 let cached: FikenMcpClient | null | undefined;
+let registeredStore: AgentRunStateStore | null = null;
 
 interface BootstrapOverrides {
   endpoint?: string;
@@ -35,6 +40,24 @@ interface BootstrapOverrides {
   privateKeyPath?: string;
   store?: ConstructorParameters<typeof FikenMcpClient>[0]["store"];
   tokenFetcher?: ConstructorParameters<typeof FikenMcpClient>[0]["tokenFetcher"];
+}
+
+/**
+ * Pre-register a production AgentRunStateStore (typically PostgresAgentRunStateStore
+ * from @paperclipai/db). Called by server/src/services/fiken-runtime-state.ts at
+ * startup when PAPERCLIP_RUNTIME_STATE_DRIVER === "postgres".
+ *
+ * Pass null to clear the registration (test helper).
+ *
+ * Precedence inside getOrInitFikenMcpClient():
+ *   overrides.store > registeredStore > new InMemoryAgentRunStateStore()
+ */
+export function registerProductionAgentRunStateStore(
+  store: AgentRunStateStore | null,
+): void {
+  registeredStore = store;
+  // Drop client cache so next call rebuilds with the new store.
+  cached = undefined;
 }
 
 /**
@@ -62,7 +85,8 @@ export function getOrInitFikenMcpClient(
 
   const tokenFetcher =
     overrides?.tokenFetcher ?? new FikenAccessTokenFetcher({ apiKey: agentApiKey });
-  const store = overrides?.store ?? new InMemoryAgentRunStateStore();
+  const store =
+    overrides?.store ?? registeredStore ?? new InMemoryAgentRunStateStore();
 
   cached = new FikenMcpClient({
     endpoint,
@@ -75,4 +99,5 @@ export function getOrInitFikenMcpClient(
 /** Test helper — drop the singleton so the next call re-evaluates env. */
 export function _resetFikenMcpClientForTest(): void {
   cached = undefined;
+  registeredStore = null;
 }

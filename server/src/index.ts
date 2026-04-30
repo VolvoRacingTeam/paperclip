@@ -35,6 +35,8 @@ import {
   workerLearningSynthesizer,
   workerReviewMetricsService,
   managerSonnetUsageService,
+  initFikenRuntimeStateStore,
+  tickAgentRunStepsVacuum,
 } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -568,7 +570,12 @@ export async function startServer(): Promise<StartedServer> {
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
     });
-  
+
+  // Fiken-MCP runtime-state-store. Driver styres av PAPERCLIP_RUNTIME_STATE_DRIVER
+  // (default "memory"). Naar driver === "postgres", registreres en
+  // PostgresAgentRunStateStore i adapter-laget for M2.4-prereq DB-persistens.
+  const fikenRuntimeState = initFikenRuntimeStateStore({ db });
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
@@ -698,6 +705,35 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "worker_review_metrics tick failed");
           });
       }, metricsIntervalMs);
+    }
+
+    // M2.4-prereq: vacuum-cron for agent_run_steps. Sletter rader hvor
+    // expires_at < NOW(). Kjorer en gang per UTC-dag etter klokken 03:00 UTC.
+    // Noop naar driver === "memory".
+    {
+      const vacuumIntervalMs = 60 * 60 * 1000; // hourly check, daily fire
+      let lastVacuumDate: string | null = null;
+      const tickIfVacuumDue = () => {
+        const now = new Date();
+        if (now.getUTCHours() < 3) return;
+        const today = now.toISOString().slice(0, 10);
+        if (lastVacuumDate === today) return;
+        lastVacuumDate = today;
+        void tickAgentRunStepsVacuum(fikenRuntimeState, now)
+          .then((deleted) => {
+            if (deleted > 0 || fikenRuntimeState.driver === "postgres") {
+              logger.info(
+                { deleted, driver: fikenRuntimeState.driver },
+                "agent_run_steps vacuum tick complete",
+              );
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "agent_run_steps vacuum tick failed");
+          });
+      };
+      tickIfVacuumDue();
+      setInterval(tickIfVacuumDue, vacuumIntervalMs);
     }
   }
 
