@@ -40,6 +40,14 @@ import {
   executeFikenTool,
   isFikenTool,
 } from "./fiken-tools.js";
+import {
+  buildFikenMcpToolExecutor,
+  isFikenMcpTool,
+  resolveEnabledFikenMcpTools,
+  type FikenMcpExecutorContext,
+} from "./fiken-mcp-tools.js";
+import { getOrInitFikenMcpClient } from "./fiken-mcp-bootstrap.js";
+import { ulid } from "./fiken-mcp/index.js";
 
 // ---------------------------------------------------------------------------
 // Factory options
@@ -113,10 +121,29 @@ export async function executeAdapter(
     parametersSchema: d.parametersSchema,
   }));
   // Kundeoversikt built-in tools (email pipeline — see kundeoversikt-tools.ts)
-  const tools: ToolDefinition[] = [...pluginTools, ...KUNDEOVERSIKT_TOOL_DEFINITIONS, ...FIKEN_TOOL_DEFINITIONS];
+  // Fikenverktøy MCP wrapper-tools (M2.2) — gated by both env config + per-agent
+  // adapter_config.fikenverktoy_mcp_enabled_tools allowlist. Default: empty.
+  const fikenMcpClient = getOrInitFikenMcpClient();
+  const enabledFikenMcpTools = fikenMcpClient
+    ? resolveEnabledFikenMcpTools(ctx.agent.adapterConfig)
+    : [];
+  const fikenMcpExecutor = fikenMcpClient
+    ? buildFikenMcpToolExecutor(fikenMcpClient)
+    : null;
+  const fikenMcpCorrelationId = ulid();
+  let fikenMcpStepIndex = 0;
+
+  const tools: ToolDefinition[] = [
+    ...pluginTools,
+    ...KUNDEOVERSIKT_TOOL_DEFINITIONS,
+    ...FIKEN_TOOL_DEFINITIONS,
+    ...enabledFikenMcpTools,
+  ];
 
   // Build a ToolExecutor that routes tool-calls to the right handler:
   // - Kundeoversikt built-in tools → executeKundeoversiktTool (HTTP)
+  // - Legacy Fiken direct-API tools → executeFikenTool
+  // - Fikenverktøy MCP wrapper-tools → fikenMcpExecutor (when enabled)
   // - All other tools → PluginToolDispatcher (plugin workers)
   const projectId = extractProjectId(ctx);
   const executeTool: ToolExecutor = async (name, args) => {
@@ -130,6 +157,21 @@ export async function executeAdapter(
     }
     if (isFikenTool(name)) {
       return executeFikenTool(name, args);
+    }
+    if (fikenMcpExecutor && isFikenMcpTool(name)) {
+      const mcpCtx: FikenMcpExecutorContext = {
+        agentId: ctx.agent.id,
+        agentName: ctx.agent.name,
+        // Open Q4 in spec — Paperclip companyId stands in for MCP tenantId
+        // until DB-backed agent_runtime_state lookup is wired.
+        tenantId: ctx.agent.companyId,
+        runId: ctx.runId,
+        taskId: ctx.runtime.taskKey ?? ctx.runId,
+        correlationId: fikenMcpCorrelationId,
+        stepIndex: fikenMcpStepIndex++,
+        companySlug: extractFikenCompanySlug(ctx.agent.adapterConfig),
+      };
+      return fikenMcpExecutor(name, args, mcpCtx);
     }
     const execution = await dispatcher.executeTool(name, args, {
       agentId: ctx.agent.id,
@@ -329,6 +371,12 @@ function extractProjectId(ctx: AdapterExecutionContext): string {
   // the correct behavior for shadow-testing — we'll learn which tools
   // care about projectId and populate it properly in a follow-up.
   return ctx.agent.companyId;
+}
+
+function extractFikenCompanySlug(adapterConfig: unknown): string | undefined {
+  if (!adapterConfig || typeof adapterConfig !== "object") return undefined;
+  const slug = (adapterConfig as { fiken_company_slug?: unknown }).fiken_company_slug;
+  return typeof slug === "string" && slug.length > 0 ? slug : undefined;
 }
 
 function shapeToolResult(result: ToolResultLike): unknown {
