@@ -30,3 +30,11 @@ export {
   formatEmbeddedPostgresError,
 } from "./embedded-postgres-error.js";
 export * from "./schema/index.js";
+export {
+  PostgresAgentRunStateStore,
+  AGENT_RUN_STEPS_TTL_MS,
+  type AgentRunStep,
+  type AgentRunStateStore,
+  type ResolveStepResult,
+  type PostgresAgentRunStateStoreOptions,
+} from "./stores/agent-run-state-store.js";

@@ -86,3 +86,14 @@ export {
   executeFikenTool,
   isFikenTool,
 } from "./fiken-tools.js";
+
+// ---------------------------------------------------------------------------
+// Fikenverktoy MCP wrapper-laget (M2.1+) bootstrap + types
+// ---------------------------------------------------------------------------
+
+export {
+  getOrInitFikenMcpClient,
+  registerProductionAgentRunStateStore,
+  _resetFikenMcpClientForTest,
+} from "./fiken-mcp-bootstrap.js";
+export type { AgentRunStateStore } from "./fiken-mcp/index.js";

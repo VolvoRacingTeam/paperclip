@@ -56,3 +56,9 @@ export {
   buildUsageRecordFromAdapterResult,
   MANAGER_WAKE_REASONS,
 } from "./manager-sonnet-usage.js";
+export {
+  initFikenRuntimeStateStore,
+  tickAgentRunStepsVacuum,
+  type AgentRunStateDriver,
+  type FikenRuntimeStateInit,
+} from "./fiken-runtime-state.js";
